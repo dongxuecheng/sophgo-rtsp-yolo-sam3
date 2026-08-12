@@ -1,0 +1,45 @@
+runtime:
+  dev_id: 0
+  # 建议固定到 README 指定的 sophon-demo release commit。
+  sophon_demo_root: /opt/sophon-demo
+  output_root: ../output
+  decoder_queue_size: 2
+  read_timeout_sec: 2
+  reconnect_cooldown_sec: 10
+  min_free_disk_gb: 2
+  log_level: INFO
+
+cameras:
+  - id: camera_01
+    url: rtsp://user:password@192.168.1.101:554/stream1
+  # 最多 5 路；按需取消并修改下面条目。
+  # - id: camera_02
+  #   url: rtsp://user:password@192.168.1.102:554/stream1
+
+models:
+  yolo26:
+    enabled: true
+    bmodel: /opt/models/yolo26/fire_smoke_yolo26s_int8_1b.bmodel
+    class_names: ./fire_smoke.names
+    target_classes: [fire, smoke]
+    conf_threshold: 0.25
+    interval_sec: 3
+    # 0 表示每次命中都保存；持续火情建议 30 秒以上以保护 64GB eMMC。
+    save_cooldown_sec: 30
+
+  sam3:
+    enabled: false
+    model_dir: /opt/sophon-demo/sample/SAM3/models/BM1684X_504
+    postprocess_weights: /opt/sophon-demo/sample/SAM3/models/post_process_weights.npz
+    bpe_path: /opt/models/sam3/bpe_simple_vocab_16e6.txt.gz
+    precision: f16
+    resolution: 504
+    score_threshold: 0.30
+    interval_sec: 20
+    save_cooldown_sec: 60
+    prompts:
+      - label: fire
+        text: fire
+      - label: smoke
+        text: smoke
+

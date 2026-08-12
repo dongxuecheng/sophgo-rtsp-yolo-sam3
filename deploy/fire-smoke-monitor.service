@@ -1,0 +1,17 @@
+[Unit]
+Description=BM1684X Fire and Smoke Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=linaro
+WorkingDirectory=/opt/fire-smoke-monitor
+ExecStart=/opt/fire-smoke-monitor/.venv/bin/python -m fire_smoke_monitor --config /opt/fire-smoke-monitor/config/config.yaml
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+
