@@ -61,6 +61,11 @@ tests/                       不依赖算能硬件的配置/调度测试
 
 ## 3. SoC 原生环境
 
+环境准备文档：
+
+- 设备仍是较旧 SophonSDK 时，参见 [BM1684X SoC 在线升级 SDK v26.03.01](docs/BM1684X_SDK_26.03.01_OTA_UPGRADE.md)。
+- SDK v26.03.01 缺少匹配的 SAIL Python 运行时时，参见 [SAIL v3.11.1 面向 BM1684X SDK v26.03.01 的交叉编译记录](docs/SAIL_3.11.1_BM1684X_SDK_26.03.01_CROSS_COMPILE.md)。
+
 ### 3.1 版本要求
 
 - BM1684X SoC，设备号通常为 `0`。
@@ -71,6 +76,12 @@ tests/                       不依赖算能硬件的配置/调度测试
 - NumPy 1.24+、PyYAML 6.x。
 
 不要用 pip 安装普通 `opencv-python` 覆盖 SoC 自带的 Sophon OpenCV，也不要从 PyPI 猜测安装 `sophon-sail`。驱动、运行时、SAIL、FFmpeg 和 OpenCV 应来自同一版算能 SDK/盒子系统镜像。
+
+SDK v26.03.01 SoC 镜像中的 Python 绑定实测位于以下目录；先加入当前 shell 的模块搜索路径：
+
+```bash
+export PYTHONPATH=/opt/sophon/sophon-opencv-latest/opencv-python${PYTHONPATH:+:$PYTHONPATH}
+```
 
 先验证硬件环境：
 
@@ -419,4 +430,3 @@ PYTHONPATH=src pytest -q
 ## 10. 第三方代码边界
 
 本仓库只包含调度和适配代码。运行时动态加载外部 sophon-demo 文件；sophon-demo 自身采用 2-Clause BSD（第三方组件除外）。Ultralytics、Meta SAM3、模型权重和数据集各自受其许可证约束，商用部署前应单独核对。
-
