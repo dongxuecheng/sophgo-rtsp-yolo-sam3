@@ -1,6 +1,6 @@
 # BM1684X 多路 RTSP 火焰/烟雾检测
 
-面向 16GB 内存、64GB eMMC 的 BM1684X SoC 盒子。服务原生运行，不使用 Docker；最多接入 5 路 RTSP，可按配置启用 YOLO26、SAM3 或同时启用两者。各模型有独立检测周期，只有命中火焰/烟雾时才保存带框 JPEG，并按模型分目录。
+面向 16GB 内存、64GB eMMC 的 BM1684X SoC 盒子。服务原生运行，不使用 Docker；最多接入 16 路 RTSP，可按配置启用 YOLO26、SAM3 或同时启用两者。各模型有独立检测周期，只有命中火焰/烟雾时才保存带框 JPEG，并按模型分目录。
 
 本实现对齐 [sophgo/sophon-demo `release@dfe0dff`](https://github.com/sophgo/sophon-demo/tree/dfe0dff31c21984b681536df9cb2b1ba6c96a8a4)，复用其中官方 YOLO26 BMCV 和 SAM3 Python 推理实现，不复制、魔改官方算法源码。
 
@@ -8,7 +8,7 @@
 
 ```mermaid
 flowchart LR
-    RTSP["1～5 路 RTSP"] --> MD["SAIL MultiDecoder\nVPU 硬解码 + 最新帧队列"]
+    RTSP["1～16 路 RTSP"] --> MD["每路独立 SAIL MultiDecoder\nVPU 硬解码 + 最新帧队列"]
     MD --> S["单进程调度器\nYOLO 优先，SAM3 每轮一路"]
     S -->|"每路独立周期"| Y["YOLO26\nBMCV + TPU"]
     S -->|"每路独立周期"| A["SAM3 504\n9 个 BModel + TPU"]
@@ -21,7 +21,7 @@ flowchart LR
 
 关键取舍：
 
-- `MultiDecoder(queue_size=2, discard_mode=1)` 让底层持续硬解码，队列满时丢弃旧帧。即使几秒才检测一次，也不会顺序处理积压视频。
+- 每路摄像头拥有独立的 `MultiDecoder(queue_size=2, discard_mode=1)` 和连接生命周期线程，底层持续硬解码且队列满时丢弃旧帧。调度器通过 `read_mode=0` 非阻塞取帧；故障流无帧时立即跳过。持续无帧达到 `read_timeout_sec` 后只在该路后台销毁并重建解码器，摄像头重新上线后自动恢复，不影响其他摄像头。
 - TPU 推理串行执行，避免 YOLO26 与 9 段 SAM3 同时争用 BM1684X。先清空到期 YOLO 任务，再执行一个 SAM3 任务，然后重新检查 YOLO。
 - YOLO26 使用官方 `yolo26_bmcv.py`：色彩转换、缩放、归一化由 BMCV 完成，BModel 在 TPU 上执行。
 - SAM3 的 ViT、Neck、Text Encoder、Grounding Encoder/Decoder 均为 BModel；文本提示只在启动时编码一次。
@@ -346,8 +346,8 @@ sam3:
 
 | YOLO26 | SAM3 | 行为 |
 |---|---|---|
-| `true` | `false` | 5 路都只按 YOLO 周期检测 |
-| `false` | `true` | 5 路都只按 SAM3 周期检测 |
+| `true` | `false` | 所有摄像头都只按 YOLO 周期检测 |
+| `false` | `true` | 所有摄像头都只按 SAM3 周期检测 |
 | `true` | `true` | 每路独立执行两种模型，分别保存 |
 
 两者都为 `false` 会被配置校验拒绝。关闭的模型不会加载，不占相应 TPU/内存资源。目前开关是启动配置，不做热切换；修改后执行 `systemctl restart fire-smoke-monitor`。
@@ -357,7 +357,7 @@ sam3:
 建议起点：
 
 - YOLO26：`interval_sec: 3`。
-- SAM3：`interval_sec: 20`；5 路都启用时不要设成 3 秒。
+- SAM3：1～5 路建议 `interval_sec: 20`；6～10 路建议至少 30 秒；11～16 路建议至少 60 秒。
 - 持续火灾会每次命中。为保护 eMMC，YOLO `save_cooldown_sec: 30`、SAM3 `60`；若必须保存每个命中采样帧，设为 `0`。
 - `min_free_disk_gb: 2` 会在磁盘空间不足时停止保存，但继续推理和记录错误日志。
 
@@ -397,12 +397,12 @@ sudo systemctl status fire-smoke-monitor
 journalctl -u fire-smoke-monitor -f
 ```
 
-systemd 使用 `Restart=always`，RTSP 单路读失败时程序也会按冷却时间调用 MultiDecoder 重连。SIGTERM/SIGINT 会关闭通道并释放模型。
+systemd 使用 `Restart=always`。RTSP 单路无帧时调度器会立即跳过；持续无帧后，该路独立生命周期线程会销毁并重建解码器，摄像头重新上线后自动恢复，不影响健康通道。`reconnect_cooldown_sec` 同时控制重建尝试间隔和无帧告警频率。SIGTERM/SIGINT 会关闭所有通道并释放模型。
 
 ## 8. 性能与容量预期
 
 - 算能官方数据中，BM1684X 的 SAM3 504 FP16 ViT 理论总耗时约 1.1 秒，完整框检测端到端约 2 秒量级；首次启动还包含模型和 tokenizer 冷启动。实际以盒子 SDK、主频和画面为准。
-- 5 路 SAM3、20 秒周期时，若单次约 2 秒，SAM3 平均约占一半串行执行时间；YOLO 会在相邻 SAM3 任务间获得优先级。若出现持续延迟，应增大 SAM3 周期。
+- SAM3 若单次约 2 秒，5 路完成一轮约需 10 秒，16 路约需 32 秒；YOLO 会在相邻 SAM3 任务间获得优先级。摄像头越多越应增大 SAM3 周期，11～16 路建议从 60 秒开始压测。
 - 16GB 系统内存足够运行本工程，但 NPU 内存是另一约束；必须使用 `BM1684X_504`，不要配置 1008 模型。
 - 图片容量取决于画面分辨率和火情持续时间。保存冷却与 2GB 磁盘保护只能阻止写满，不替代运维侧的定期归档/清理策略。
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Sequence
 
 from .domain import ModelRuntime
+from .streams import FrameUnavailableError
 
 
 logger = logging.getLogger(__name__)
@@ -110,6 +111,13 @@ class InferenceScheduler:
                     job.camera_id,
                     self._clock() - started,
                 )
+        except FrameUnavailableError as exc:
+            logger.debug(
+                "跳过当前无帧任务 model=%s camera=%s reason=%s",
+                job.model_name,
+                job.camera_id,
+                exc,
+            )
         except Exception:
             logger.exception("推理任务失败 model=%s camera=%s", job.model_name, job.camera_id)
         finally:
@@ -121,4 +129,3 @@ class InferenceScheduler:
         if not self._jobs:
             return 0.5
         return min(job.next_due for job in self._jobs) - self._clock()
-

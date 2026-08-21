@@ -13,6 +13,7 @@ class ConfigError(ValueError):
 
 
 _CAMERA_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+MAX_CAMERAS = 16
 
 
 @dataclass(frozen=True)
@@ -158,8 +159,10 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
         raise ConfigError("runtime.log_level 仅支持 DEBUG/INFO/WARNING/ERROR")
 
     camera_items = _sequence(_required(root, "cameras", "root"), "cameras")
-    if not 1 <= len(camera_items) <= 5:
-        raise ConfigError("cameras 数量必须在 1 到 5 路之间")
+    if not 1 <= len(camera_items) <= MAX_CAMERAS:
+        raise ConfigError(
+            "cameras 数量必须在 1 到 {} 路之间".format(MAX_CAMERAS)
+        )
     cameras: List[CameraConfig] = []
     seen_ids = set()
     for index, item in enumerate(camera_items):

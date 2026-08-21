@@ -4,7 +4,9 @@ runtime:
   sophon_demo_root: /opt/sophon-demo
   output_root: ../output
   decoder_queue_size: 2
+  # 调度器始终非阻塞；单路持续无有效帧达到该时间后，在后台重建该路解码器。
   read_timeout_sec: 2
+  # 单路解码器重建尝试间隔，同时也是无帧告警冷却时间。
   reconnect_cooldown_sec: 10
   min_free_disk_gb: 2
   log_level: INFO
@@ -12,7 +14,7 @@ runtime:
 cameras:
   - id: camera_01
     url: rtsp://user:password@192.168.1.101:554/stream1
-  # 最多 5 路；按需取消并修改下面条目。
+  # 最多 16 路；按需继续添加唯一 id 和对应 RTSP 地址。
   # - id: camera_02
   #   url: rtsp://user:password@192.168.1.102:554/stream1
 
@@ -42,4 +44,3 @@ models:
         text: fire
       - label: smoke
         text: smoke
-

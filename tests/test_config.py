@@ -4,6 +4,7 @@ import pytest
 
 from fire_smoke_monitor.config import (
     ConfigError,
+    MAX_CAMERAS,
     load_config,
     parse_config,
     validate_runtime_paths,
@@ -71,14 +72,26 @@ def test_reject_both_models_disabled(tmp_path: Path):
         parse_config(data, tmp_path)
 
 
-def test_reject_more_than_five_cameras(tmp_path: Path):
+def test_accept_maximum_camera_count(tmp_path: Path):
     data = valid_data()
     data["cameras"] = [
         {"id": "cam_{}".format(index), "url": "rtsp://example.invalid/{}".format(index)}
-        for index in range(6)
+        for index in range(MAX_CAMERAS)
     ]
 
-    with pytest.raises(ConfigError, match="1 到 5"):
+    config = parse_config(data, tmp_path)
+
+    assert len(config.cameras) == MAX_CAMERAS
+
+
+def test_reject_more_than_maximum_cameras(tmp_path: Path):
+    data = valid_data()
+    data["cameras"] = [
+        {"id": "cam_{}".format(index), "url": "rtsp://example.invalid/{}".format(index)}
+        for index in range(MAX_CAMERAS + 1)
+    ]
+
+    with pytest.raises(ConfigError, match="1 到 {}".format(MAX_CAMERAS)):
         parse_config(data, tmp_path)
 
 
