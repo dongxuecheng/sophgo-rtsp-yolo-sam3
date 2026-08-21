@@ -61,6 +61,8 @@ class Sam3Config:
     precision: str
     resolution: int
     score_threshold: float
+    relative_score_ratio: float
+    pre_nms_top_k: int
     nms_threshold: float
     max_detections_per_prompt: int
     interval_sec: float
@@ -228,13 +230,20 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
         precision=str(sam_raw.get("precision", "f16")).lower(),
         resolution=int(sam_raw.get("resolution", 504)),
         score_threshold=_probability(
-            sam_raw.get("score_threshold", 0.3), "models.sam3.score_threshold"
+            sam_raw.get("score_threshold", 0.15), "models.sam3.score_threshold"
+        ),
+        relative_score_ratio=_probability(
+            sam_raw.get("relative_score_ratio", 0.65),
+            "models.sam3.relative_score_ratio",
+        ),
+        pre_nms_top_k=int(
+            sam_raw.get("pre_nms_top_k", 10)
         ),
         nms_threshold=_probability(
-            sam_raw.get("nms_threshold", 0.5), "models.sam3.nms_threshold"
+            sam_raw.get("nms_threshold", 0.35), "models.sam3.nms_threshold"
         ),
         max_detections_per_prompt=int(
-            sam_raw.get("max_detections_per_prompt", 100)
+            sam_raw.get("max_detections_per_prompt", 5)
         ),
         interval_sec=_positive(
             sam_raw.get("interval_sec", 20), "models.sam3.interval_sec"
@@ -247,6 +256,8 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
         raise ConfigError("BM1684X SoC 的 SAM3 当前仅建议/支持 precision=f16")
     if sam.enabled and sam.resolution != 504:
         raise ConfigError("16GB BM1684X SoC 的完整 SAM3 检测链路必须使用 resolution=504")
+    if not 1 <= sam.pre_nms_top_k <= 1000:
+        raise ConfigError("models.sam3.pre_nms_top_k 必须在 1 到 1000 之间")
     if not 1 <= sam.max_detections_per_prompt <= 1000:
         raise ConfigError("models.sam3.max_detections_per_prompt 必须在 1 到 1000 之间")
     if sam.enabled and sam.postprocess_weights.name != "post_process_weights.npz":

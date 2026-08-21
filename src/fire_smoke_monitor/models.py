@@ -120,6 +120,8 @@ class Sam3Detector:
         )
         self._prompts: Tuple[SamPrompt, ...] = tuple(config.prompts)
         self._threshold = config.score_threshold
+        self._relative_score_ratio = config.relative_score_ratio
+        self._pre_nms_top_k = config.pre_nms_top_k
         self._nms_threshold = config.nms_threshold
         self._max_detections_per_prompt = config.max_detections_per_prompt
         prompt_texts = [prompt.text for prompt in self._prompts]
@@ -130,12 +132,14 @@ class Sam3Detector:
         )
         logger.info(
             "SAM3 已加载 resolution=%d precision=%s prompts=%s "
-            "score_threshold=%.3f nms_threshold=%.3f max_per_prompt=%d "
-            "mask=disabled",
+            "score_threshold=%.3f relative_score_ratio=%.3f pre_nms_top_k=%d "
+            "nms_threshold=%.3f max_per_prompt=%d mask=disabled",
             config.resolution,
             config.precision,
             ",".join(prompt.label for prompt in self._prompts),
             self._threshold,
+            self._relative_score_ratio,
+            self._pre_nms_top_k,
             self._nms_threshold,
             self._max_detections_per_prompt,
         )
@@ -200,9 +204,19 @@ class Sam3Detector:
                 )
             )
 
-        candidate_indices = np.flatnonzero(
-            np.isfinite(scores) & (scores >= self._threshold)
+        finite_indices = np.flatnonzero(np.isfinite(scores))
+        if finite_indices.size == 0:
+            return []
+        best_score = float(np.max(scores[finite_indices]))
+        effective_threshold = max(
+            self._threshold, best_score * self._relative_score_ratio
         )
+        candidate_indices = np.flatnonzero(
+            np.isfinite(scores) & (scores >= effective_threshold)
+        )
+        candidate_indices = candidate_indices[
+            np.argsort(scores[candidate_indices])[::-1]
+        ][: self._pre_nms_top_k]
         candidates: List[Detection] = []
         for index in candidate_indices:
             score = float(scores[index])
@@ -228,9 +242,12 @@ class Sam3Detector:
 
         kept = self._nms(candidates)
         logger.debug(
-            "SAM3 框后处理 label=%s raw=%d above_threshold=%d valid=%d kept=%d",
+            "SAM3 框后处理 label=%s raw=%d best=%.4f effective_threshold=%.4f "
+            "pre_nms=%d valid=%d kept=%d",
             label,
             scores.size,
+            best_score,
+            effective_threshold,
             candidate_indices.size,
             len(candidates),
             len(kept),

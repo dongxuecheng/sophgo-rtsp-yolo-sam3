@@ -36,10 +36,12 @@ models:
     bpe_path: /opt/models/sam3/bpe_simple_vocab_16e6.txt.gz
     precision: f16
     resolution: 504
-    score_threshold: 0.30
-    # 同一提示词的候选框按 IoU 执行 NMS，并限制单帧最大保留数量。
-    nms_threshold: 0.50
-    max_detections_per_prompt: 100
+    # 先保住低置信度火焰/烟雾，再用相对分数、Top-K 和 NMS 收敛候选框。
+    score_threshold: 0.15
+    relative_score_ratio: 0.65
+    pre_nms_top_k: 10
+    nms_threshold: 0.35
+    max_detections_per_prompt: 5
     interval_sec: 20
     save_cooldown_sec: 60
     prompts:
