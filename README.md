@@ -329,6 +329,8 @@ sam3:
   precision: f16
   resolution: 504
   score_threshold: 0.30
+  nms_threshold: 0.50
+  max_detections_per_prompt: 100
   interval_sec: 20
   save_cooldown_sec: 60
   prompts:
@@ -338,7 +340,7 @@ sam3:
       text: smoke
 ```
 
-`text` 是送给 SAM3 的英文开放词汇提示，`label` 是保存文件名/内部结果使用的短名称。提示在启动时一次性编码；修改配置后需要重启服务。
+`text` 是送给 SAM3 的英文开放词汇提示，`label` 是保存文件名/内部结果使用的短名称。`score_threshold` 过滤低分候选框，`nms_threshold` 对同一提示词的重叠框执行 NMS，`max_detections_per_prompt` 限制每个提示词单帧最多保留的框数。提示在启动时一次性编码；修改配置后需要重启服务。
 
 ## 6. 模型开关和调度配置
 

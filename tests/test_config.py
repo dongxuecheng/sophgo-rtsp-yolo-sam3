@@ -48,6 +48,8 @@ def test_parse_valid_yolo_only_and_resolve_relative_paths(tmp_path: Path):
     assert config.yolo26.interval_sec == 3
     assert config.runtime.output_root == (tmp_path / "output").resolve()
     assert config.yolo26.class_names == (tmp_path / "config/fire_smoke.names").resolve()
+    assert config.sam3.nms_threshold == 0.5
+    assert config.sam3.max_detections_per_prompt == 100
 
 
 def test_both_models_can_be_enabled(tmp_path: Path):
@@ -57,11 +59,23 @@ def test_both_models_can_be_enabled(tmp_path: Path):
         {"label": "fire", "text": "fire"},
         {"label": "smoke", "text": "smoke"},
     ]
+    data["models"]["sam3"]["nms_threshold"] = 0.4
+    data["models"]["sam3"]["max_detections_per_prompt"] = 25
 
     config = parse_config(data, tmp_path)
 
     assert config.yolo26.enabled and config.sam3.enabled
     assert [prompt.label for prompt in config.sam3.prompts] == ["fire", "smoke"]
+    assert config.sam3.nms_threshold == 0.4
+    assert config.sam3.max_detections_per_prompt == 25
+
+
+def test_reject_invalid_sam3_max_detections(tmp_path: Path):
+    data = valid_data()
+    data["models"]["sam3"]["max_detections_per_prompt"] = 0
+
+    with pytest.raises(ConfigError, match="max_detections_per_prompt"):
+        parse_config(data, tmp_path)
 
 
 def test_reject_both_models_disabled(tmp_path: Path):

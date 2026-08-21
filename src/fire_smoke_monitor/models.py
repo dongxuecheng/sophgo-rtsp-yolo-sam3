@@ -120,6 +120,8 @@ class Sam3Detector:
         )
         self._prompts: Tuple[SamPrompt, ...] = tuple(config.prompts)
         self._threshold = config.score_threshold
+        self._nms_threshold = config.nms_threshold
+        self._max_detections_per_prompt = config.max_detections_per_prompt
         prompt_texts = [prompt.text for prompt in self._prompts]
 
         # Text prompts are static for this service, so encode them once on TPU.
@@ -127,10 +129,15 @@ class Sam3Detector:
             self._pipeline.text_encoder(prompt_texts)
         )
         logger.info(
-            "SAM3 已加载 resolution=%d precision=%s prompts=%s mask=disabled",
+            "SAM3 已加载 resolution=%d precision=%s prompts=%s "
+            "score_threshold=%.3f nms_threshold=%.3f max_per_prompt=%d "
+            "mask=disabled",
             config.resolution,
             config.precision,
             ",".join(prompt.label for prompt in self._prompts),
+            self._threshold,
+            self._nms_threshold,
+            self._max_detections_per_prompt,
         )
 
     def detect(self, image: Any) -> List[Detection]:
@@ -161,39 +168,103 @@ class Sam3Detector:
             )
             if result is None:
                 raise RuntimeError("SAM3 TPU grounding 未返回结果；项目禁止 CPU 回退")
-            detection = self._top_detection(
-                result, prompt.label, width=width, height=height
+            detections.extend(
+                self._detections_from_result(
+                    result, prompt.label, width=width, height=height
+                )
             )
-            if detection is not None:
-                detections.append(detection)
         return detections
 
-    def _top_detection(
+    def _detections_from_result(
         self, result: Dict[str, np.ndarray], label: str, width: int, height: int
-    ) -> Any:
-        scores = np.asarray(result["pred_scores"])[0, :, 0]
-        if scores.size == 0:
-            return None
-        best_index = int(np.argmax(scores))
-        score = float(scores[best_index])
-        if not np.isfinite(score) or score < self._threshold:
-            return None
-        cx, cy, box_w, box_h = [
-            float(value) for value in np.asarray(result["pred_boxes"])[0, best_index]
-        ]
-        if not np.all(np.isfinite([cx, cy, box_w, box_h])):
-            return None
-        x1 = max(0, min(width - 1, int(round((cx - box_w / 2.0) * width))))
-        y1 = max(0, min(height - 1, int(round((cy - box_h / 2.0) * height))))
-        x2 = max(0, min(width - 1, int(round((cx + box_w / 2.0) * width))))
-        y2 = max(0, min(height - 1, int(round((cy + box_h / 2.0) * height))))
-        if x2 <= x1 or y2 <= y1:
-            return None
-        return Detection(label=label, score=score, x1=x1, y1=y1, x2=x2, y2=y2)
+    ) -> List[Detection]:
+        score_output = np.asarray(result["pred_scores"])
+        box_output = np.asarray(result["pred_boxes"])
+        if (
+            score_output.ndim != 3
+            or score_output.shape[0] < 1
+            or score_output.shape[2] < 1
+        ):
+            raise RuntimeError(
+                "SAM3 pred_scores 形状无效: {}".format(score_output.shape)
+            )
+        if box_output.ndim != 3 or box_output.shape[0] < 1 or box_output.shape[2] < 4:
+            raise RuntimeError("SAM3 pred_boxes 形状无效: {}".format(box_output.shape))
+
+        scores = score_output[0, :, 0]
+        boxes = box_output[0, :, :4]
+        if scores.shape[0] != boxes.shape[0]:
+            raise RuntimeError(
+                "SAM3 分数与框数量不一致: scores={} boxes={}".format(
+                    scores.shape[0], boxes.shape[0]
+                )
+            )
+
+        candidate_indices = np.flatnonzero(
+            np.isfinite(scores) & (scores >= self._threshold)
+        )
+        candidates: List[Detection] = []
+        for index in candidate_indices:
+            score = float(scores[index])
+            cx, cy, box_w, box_h = [float(value) for value in boxes[index]]
+            if not np.all(np.isfinite([cx, cy, box_w, box_h])):
+                continue
+            x1 = max(0, min(width - 1, int(round((cx - box_w / 2.0) * width))))
+            y1 = max(0, min(height - 1, int(round((cy - box_h / 2.0) * height))))
+            x2 = max(0, min(width - 1, int(round((cx + box_w / 2.0) * width))))
+            y2 = max(0, min(height - 1, int(round((cy + box_h / 2.0) * height))))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            candidates.append(
+                Detection(
+                    label=label,
+                    score=score,
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                )
+            )
+
+        kept = self._nms(candidates)
+        logger.debug(
+            "SAM3 框后处理 label=%s raw=%d above_threshold=%d valid=%d kept=%d",
+            label,
+            scores.size,
+            candidate_indices.size,
+            len(candidates),
+            len(kept),
+        )
+        return kept
+
+    def _nms(self, detections: Sequence[Detection]) -> List[Detection]:
+        ordered = sorted(detections, key=lambda item: item.score, reverse=True)
+        kept: List[Detection] = []
+        for candidate in ordered:
+            if any(
+                self._box_iou(candidate, selected) > self._nms_threshold
+                for selected in kept
+            ):
+                continue
+            kept.append(candidate)
+            if len(kept) >= self._max_detections_per_prompt:
+                break
+        return kept
+
+    @staticmethod
+    def _box_iou(left: Detection, right: Detection) -> float:
+        intersection_width = max(0, min(left.x2, right.x2) - max(left.x1, right.x1))
+        intersection_height = max(0, min(left.y2, right.y2) - max(left.y1, right.y1))
+        intersection = intersection_width * intersection_height
+        if intersection == 0:
+            return 0.0
+        left_area = (left.x2 - left.x1) * (left.y2 - left.y1)
+        right_area = (right.x2 - right.x1) * (right.y2 - right.y1)
+        union = left_area + right_area - intersection
+        return intersection / union if union > 0 else 0.0
 
     def close(self) -> None:
         pipeline = getattr(self, "_pipeline", None)
         if pipeline is not None:
             pipeline.close()
             self._pipeline = None
-

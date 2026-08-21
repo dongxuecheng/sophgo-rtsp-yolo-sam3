@@ -37,6 +37,9 @@ models:
     precision: f16
     resolution: 504
     score_threshold: 0.30
+    # 同一提示词的候选框按 IoU 执行 NMS，并限制单帧最大保留数量。
+    nms_threshold: 0.50
+    max_detections_per_prompt: 100
     interval_sec: 20
     save_cooldown_sec: 60
     prompts:
