@@ -28,24 +28,3 @@ models:
     interval_sec: 3
     # 0 表示每次命中都保存；持续火情建议 30 秒以上以保护 64GB eMMC。
     save_cooldown_sec: 30
-
-  sam3:
-    enabled: false
-    model_dir: /opt/sophon-demo/sample/SAM3/models/BM1684X_504
-    postprocess_weights: /opt/sophon-demo/sample/SAM3/models/post_process_weights.npz
-    bpe_path: /opt/models/sam3/bpe_simple_vocab_16e6.txt.gz
-    precision: f16
-    resolution: 504
-    # 先保住低置信度火焰/烟雾，再用相对分数、Top-K 和 NMS 收敛候选框。
-    score_threshold: 0.15
-    relative_score_ratio: 0.65
-    pre_nms_top_k: 10
-    nms_threshold: 0.35
-    max_detections_per_prompt: 5
-    interval_sec: 20
-    save_cooldown_sec: 60
-    prompts:
-      - label: fire
-        text: fire
-      - label: smoke
-        text: smoke

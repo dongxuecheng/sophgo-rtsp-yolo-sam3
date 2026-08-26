@@ -43,10 +43,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         validate_runtime_paths(config)
         if args.check_config:
             logger.info(
-                "配置检查通过 cameras=%d yolo26=%s sam3=%s",
+                "配置检查通过 cameras=%d model=yolo26",
                 len(config.cameras),
-                config.yolo26.enabled,
-                config.sam3.enabled,
             )
             return 0
     except (ConfigError, ValueError, OSError) as exc:
@@ -78,4 +76,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

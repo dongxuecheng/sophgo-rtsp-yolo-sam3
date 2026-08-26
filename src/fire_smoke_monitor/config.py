@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Sequence
 
 import yaml
 
@@ -46,35 +46,10 @@ class Yolo26Config:
 
 
 @dataclass(frozen=True)
-class SamPrompt:
-    label: str
-    text: str
-
-
-@dataclass(frozen=True)
-class Sam3Config:
-    enabled: bool
-    model_dir: Path
-    postprocess_weights: Path
-    bpe_path: Path
-    prompts: Sequence[SamPrompt]
-    precision: str
-    resolution: int
-    score_threshold: float
-    relative_score_ratio: float
-    pre_nms_top_k: int
-    nms_threshold: float
-    max_detections_per_prompt: int
-    interval_sec: float
-    save_cooldown_sec: float
-
-
-@dataclass(frozen=True)
 class AppConfig:
     runtime: RuntimeConfig
     cameras: Sequence[CameraConfig]
     yolo26: Yolo26Config
-    sam3: Sam3Config
 
 
 def _mapping(value: Any, name: str) -> Mapping[str, Any]:
@@ -134,7 +109,6 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
     runtime_raw = _mapping(_required(root, "runtime", "root"), "runtime")
     models_raw = _mapping(_required(root, "models", "root"), "models")
     yolo_raw = _mapping(_required(models_raw, "yolo26", "models"), "models.yolo26")
-    sam_raw = _mapping(_required(models_raw, "sam3", "models"), "models.sam3")
 
     runtime = RuntimeConfig(
         dev_id=int(runtime_raw.get("dev_id", 0)),
@@ -185,9 +159,11 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
         cameras.append(CameraConfig(camera_id=camera_id, url=url))
 
     yolo_enabled = _boolean(yolo_raw.get("enabled", False), "models.yolo26.enabled")
+    if not yolo_enabled:
+        raise ConfigError("本项目仅保留 YOLO26，models.yolo26.enabled 必须为 true")
     target_classes = [str(v).strip() for v in yolo_raw.get("target_classes", [])]
-    if yolo_enabled and not target_classes:
-        raise ConfigError("启用 YOLO26 时 target_classes 不能为空")
+    if not target_classes:
+        raise ConfigError("YOLO26 target_classes 不能为空")
     yolo = Yolo26Config(
         enabled=yolo_enabled,
         bmodel=_path(yolo_raw.get("bmodel", "missing.bmodel"), base_dir),
@@ -205,67 +181,7 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
         ),
     )
 
-    sam_enabled = _boolean(sam_raw.get("enabled", False), "models.sam3.enabled")
-    prompt_items = sam_raw.get("prompts", [])
-    prompts: List[SamPrompt] = []
-    if sam_enabled:
-        for index, item in enumerate(_sequence(prompt_items, "models.sam3.prompts")):
-            raw = _mapping(item, "models.sam3.prompts[{}]".format(index))
-            label = str(_required(raw, "label", "models.sam3.prompts")).strip()
-            prompt_text = str(_required(raw, "text", "models.sam3.prompts")).strip()
-            if not label or not prompt_text:
-                raise ConfigError("SAM3 prompt 的 label/text 不能为空")
-            prompts.append(SamPrompt(label=label, text=prompt_text))
-        if not prompts:
-            raise ConfigError("启用 SAM3 时 prompts 不能为空")
-
-    sam = Sam3Config(
-        enabled=sam_enabled,
-        model_dir=_path(sam_raw.get("model_dir", "missing"), base_dir),
-        postprocess_weights=_path(
-            sam_raw.get("postprocess_weights", "post_process_weights.npz"), base_dir
-        ),
-        bpe_path=_path(sam_raw.get("bpe_path", "bpe_simple_vocab_16e6.txt.gz"), base_dir),
-        prompts=tuple(prompts),
-        precision=str(sam_raw.get("precision", "f16")).lower(),
-        resolution=int(sam_raw.get("resolution", 504)),
-        score_threshold=_probability(
-            sam_raw.get("score_threshold", 0.15), "models.sam3.score_threshold"
-        ),
-        relative_score_ratio=_probability(
-            sam_raw.get("relative_score_ratio", 0.65),
-            "models.sam3.relative_score_ratio",
-        ),
-        pre_nms_top_k=int(
-            sam_raw.get("pre_nms_top_k", 10)
-        ),
-        nms_threshold=_probability(
-            sam_raw.get("nms_threshold", 0.35), "models.sam3.nms_threshold"
-        ),
-        max_detections_per_prompt=int(
-            sam_raw.get("max_detections_per_prompt", 5)
-        ),
-        interval_sec=_positive(
-            sam_raw.get("interval_sec", 20), "models.sam3.interval_sec"
-        ),
-        save_cooldown_sec=_non_negative(
-            sam_raw.get("save_cooldown_sec", 60), "models.sam3.save_cooldown_sec"
-        ),
-    )
-    if sam.enabled and sam.precision != "f16":
-        raise ConfigError("BM1684X SoC 的 SAM3 当前仅建议/支持 precision=f16")
-    if sam.enabled and sam.resolution != 504:
-        raise ConfigError("16GB BM1684X SoC 的完整 SAM3 检测链路必须使用 resolution=504")
-    if not 1 <= sam.pre_nms_top_k <= 1000:
-        raise ConfigError("models.sam3.pre_nms_top_k 必须在 1 到 1000 之间")
-    if not 1 <= sam.max_detections_per_prompt <= 1000:
-        raise ConfigError("models.sam3.max_detections_per_prompt 必须在 1 到 1000 之间")
-    if sam.enabled and sam.postprocess_weights.name != "post_process_weights.npz":
-        raise ConfigError("SAM3 后处理权重文件名必须为 post_process_weights.npz")
-    if not yolo.enabled and not sam.enabled:
-        raise ConfigError("YOLO26 和 SAM3 至少启用一个")
-
-    return AppConfig(runtime=runtime, cameras=tuple(cameras), yolo26=yolo, sam3=sam)
+    return AppConfig(runtime=runtime, cameras=tuple(cameras), yolo26=yolo)
 
 
 def load_config(path: Path) -> AppConfig:
@@ -281,50 +197,21 @@ def load_config(path: Path) -> AppConfig:
 
 def validate_runtime_paths(config: AppConfig) -> None:
     demo = config.runtime.sophon_demo_root
-    required_demo_files = []
-    if config.yolo26.enabled:
-        required_demo_files.append(demo / "sample" / "YOLO26" / "python" / "yolo26_bmcv.py")
-        if not config.yolo26.bmodel.is_file():
-            raise ConfigError("YOLO26 BModel 不存在: {}".format(config.yolo26.bmodel))
-        if not config.yolo26.class_names.is_file():
-            raise ConfigError("YOLO26 类别文件不存在: {}".format(config.yolo26.class_names))
-        with config.yolo26.class_names.open("r", encoding="utf-8") as stream:
-            class_names = [line.strip() for line in stream if line.strip()]
-        if not class_names or len(class_names) != len(set(class_names)):
-            raise ConfigError("YOLO26 类别文件为空或包含重复名称")
-        missing_targets = [
-            name for name in config.yolo26.target_classes if name not in class_names
-        ]
-        if missing_targets:
-            raise ConfigError(
-                "YOLO26 类别文件缺少目标: {}".format(", ".join(missing_targets))
-            )
-    if config.sam3.enabled:
-        required_demo_files.append(demo / "sample" / "SAM3" / "python" / "sam3_infer.py")
-        if not config.sam3.model_dir.is_dir():
-            raise ConfigError("SAM3 BModel 目录不存在: {}".format(config.sam3.model_dir))
-        expected_bmodels = [
-            *("vit/sam3_vit_part{}_f16_1b.bmodel".format(index) for index in range(5)),
-            "neck/sam3_neck_f16_1b.bmodel",
-            "grounding/sam3_grounding_encoder_f16_1b.bmodel",
-            "grounding/sam3_grounding_decoder_f16_1b.bmodel",
-            "grounding/sam3_text_encoder_f16_1b.bmodel",
-        ]
-        missing_bmodels = [
-            relative
-            for relative in expected_bmodels
-            if not (config.sam3.model_dir / relative).is_file()
-        ]
-        if missing_bmodels:
-            raise ConfigError(
-                "SAM3 BModel 不完整，缺少: {}".format(", ".join(missing_bmodels))
-            )
-        if not config.sam3.postprocess_weights.is_file():
-            raise ConfigError(
-                "SAM3 后处理权重不存在: {}".format(config.sam3.postprocess_weights)
-            )
-        if not config.sam3.bpe_path.is_file():
-            raise ConfigError("SAM3 BPE 文件不存在: {}".format(config.sam3.bpe_path))
-    for file_path in required_demo_files:
-        if not file_path.is_file():
-            raise ConfigError("sophon-demo 官方文件不存在: {}".format(file_path))
+    official_source = demo / "sample" / "YOLO26" / "python" / "yolo26_bmcv.py"
+    if not official_source.is_file():
+        raise ConfigError("sophon-demo 官方文件不存在: {}".format(official_source))
+    if not config.yolo26.bmodel.is_file():
+        raise ConfigError("YOLO26 BModel 不存在: {}".format(config.yolo26.bmodel))
+    if not config.yolo26.class_names.is_file():
+        raise ConfigError("YOLO26 类别文件不存在: {}".format(config.yolo26.class_names))
+    with config.yolo26.class_names.open("r", encoding="utf-8") as stream:
+        class_names = [line.strip() for line in stream if line.strip()]
+    if not class_names or len(class_names) != len(set(class_names)):
+        raise ConfigError("YOLO26 类别文件为空或包含重复名称")
+    missing_targets = [
+        name for name in config.yolo26.target_classes if name not in class_names
+    ]
+    if missing_targets:
+        raise ConfigError(
+            "YOLO26 类别文件缺少目标: {}".format(", ".join(missing_targets))
+        )

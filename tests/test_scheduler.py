@@ -39,30 +39,22 @@ class FakeWriter:
         return "/tmp/result.jpg"
 
 
-def test_yolo_jobs_run_before_only_one_sam_job_per_iteration():
+def test_all_due_yolo_camera_jobs_run_once_per_iteration():
     events = []
     clock = FakeClock()
-    models = {
-        # Intentionally insert SAM first: scheduler priority must not rely on dict order.
-        "sam3": ModelRuntime(FakeDetector("sam3", events), 20, 60),
-        "yolo26": ModelRuntime(FakeDetector("yolo26", events), 3, 30),
-    }
+    models = {"yolo26": ModelRuntime(FakeDetector("yolo26", events), 3, 30)}
     scheduler = InferenceScheduler(
         ["cam1", "cam2"], models, FakeSource(events), FakeWriter(events), clock
     )
 
-    assert scheduler.run_iteration() == 3
+    assert scheduler.run_iteration() == 2
 
     detects = [event for event in events if event.startswith("detect:")]
     assert detects == [
         "detect:yolo26:frame:cam1",
         "detect:yolo26:frame:cam2",
-        "detect:sam3:frame:cam1",
     ]
-
-    events.clear()
-    assert scheduler.run_iteration() == 1
-    assert "detect:sam3:frame:cam2" in events
+    assert scheduler.run_iteration() == 0
 
 
 def test_fixed_delay_prevents_catch_up_burst():
@@ -77,4 +69,3 @@ def test_fixed_delay_prevents_catch_up_burst():
     assert scheduler.run_iteration() == 0
     clock.now += 3
     assert scheduler.run_iteration() == 1
-

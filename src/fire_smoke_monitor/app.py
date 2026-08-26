@@ -6,7 +6,7 @@ from typing import Any, Dict
 
 from .config import AppConfig
 from .domain import ModelRuntime
-from .models import Sam3Detector, Yolo26Detector
+from .models import Yolo26Detector
 from .scheduler import InferenceScheduler
 from .streams import MultiRtspSource
 from .writer import DetectionWriter
@@ -35,20 +35,12 @@ class MonitorApplication:
                 raise RuntimeError("当前设备不是 BM1684X: {}".format(target))
             logger.info("硬件设备已确认 dev_id=%d target=%s", config.runtime.dev_id, target)
 
-            if config.yolo26.enabled:
-                detector = Yolo26Detector(
-                    config.yolo26,
-                    config.runtime.sophon_demo_root,
-                    config.runtime.dev_id,
-                )
-                self._detectors["yolo26"] = detector
-            if config.sam3.enabled:
-                detector = Sam3Detector(
-                    config.sam3,
-                    config.runtime.sophon_demo_root,
-                    config.runtime.dev_id,
-                )
-                self._detectors["sam3"] = detector
+            detector = Yolo26Detector(
+                config.yolo26,
+                config.runtime.sophon_demo_root,
+                config.runtime.dev_id,
+            )
+            self._detectors["yolo26"] = detector
 
             self._source = MultiRtspSource(
                 sail,
@@ -64,19 +56,13 @@ class MonitorApplication:
                 config.runtime.output_root,
                 config.runtime.min_free_disk_gb,
             )
-            runtimes: Dict[str, ModelRuntime] = {}
-            if config.yolo26.enabled:
-                runtimes["yolo26"] = ModelRuntime(
+            runtimes: Dict[str, ModelRuntime] = {
+                "yolo26": ModelRuntime(
                     detector=self._detectors["yolo26"],
                     interval_sec=config.yolo26.interval_sec,
                     save_cooldown_sec=config.yolo26.save_cooldown_sec,
                 )
-            if config.sam3.enabled:
-                runtimes["sam3"] = ModelRuntime(
-                    detector=self._detectors["sam3"],
-                    interval_sec=config.sam3.interval_sec,
-                    save_cooldown_sec=config.sam3.save_cooldown_sec,
-                )
+            }
             self._scheduler = InferenceScheduler(
                 [camera.camera_id for camera in config.cameras],
                 runtimes,
@@ -99,17 +85,13 @@ class MonitorApplication:
         if self._source is not None:
             self._source.close()
             self._source = None
-        # Close the largest model first so its TPU memory is released promptly.
-        for name in ("sam3", "yolo26"):
-            detector = self._detectors.get(name)
-            if detector is not None:
-                try:
-                    detector.close()
-                except Exception:
-                    logger.exception("关闭模型失败 model=%s", name)
+        for name, detector in tuple(self._detectors.items()):
+            try:
+                detector.close()
+            except Exception:
+                logger.exception("关闭模型失败 model=%s", name)
         self._detectors.clear()
 
 
 def build_application(config: AppConfig) -> MonitorApplication:
     return MonitorApplication(config)
-

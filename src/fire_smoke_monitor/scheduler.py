@@ -21,7 +21,7 @@ class _Job:
 
 
 class InferenceScheduler:
-    """Serial TPU scheduler: drain due YOLO work, then run one SAM3 job."""
+    """Serial TPU scheduler for independently sampled camera streams."""
 
     def __init__(
         self,
@@ -53,34 +53,14 @@ class InferenceScheduler:
         logger.info("推理调度已停止")
 
     def run_iteration(self) -> int:
-        work_count = 0
         now = self._clock()
-
-        # YOLO is short and interval-sensitive: clear all due YOLO jobs first.
-        due_yolo = sorted(
-            (
-                job
-                for job in self._jobs
-                if job.model_name == "yolo26" and job.next_due <= now
-            ),
+        due_jobs = sorted(
+            (job for job in self._jobs if job.next_due <= now),
             key=lambda job: job.next_due,
         )
-        for job in due_yolo:
+        for job in due_jobs:
             self._run_job(job)
-            work_count += 1
-
-        # SAM3 is much heavier. One job per iteration lets newly due YOLO work
-        # regain priority between two cameras' SAM3 runs.
-        now = self._clock()
-        due_sam = [
-            job
-            for job in self._jobs
-            if job.model_name == "sam3" and job.next_due <= now
-        ]
-        if due_sam:
-            self._run_job(min(due_sam, key=lambda job: job.next_due))
-            work_count += 1
-        return work_count
+        return len(due_jobs)
 
     def _run_job(self, job: _Job) -> None:
         runtime = self._models[job.model_name]
@@ -121,8 +101,8 @@ class InferenceScheduler:
         except Exception:
             logger.exception("推理任务失败 model=%s camera=%s", job.model_name, job.camera_id)
         finally:
-            # Fixed-delay scheduling intentionally avoids catch-up bursts after
-            # a slow SAM3 inference or a temporarily unavailable stream.
+            # Fixed-delay scheduling avoids catch-up bursts after inference or
+            # a temporarily unavailable stream.
             job.next_due = self._clock() + runtime.interval_sec
 
     def _seconds_until_next_job(self) -> float:
