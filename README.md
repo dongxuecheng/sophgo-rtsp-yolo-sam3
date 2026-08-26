@@ -2,7 +2,7 @@
 
 面向 SE7-32（BM1684X）SoC 盒子的轻量监控服务。程序原生运行，不依赖 Docker，支持最多 16 路 RTSP；各摄像头按可配置周期抽取最新帧，通过 YOLO26 BModel 检测指定类别，命中后保存带框 JPEG。
 
-本项目复用 [sophgo/sophon-demo](https://github.com/sophgo/sophon-demo) 的官方 YOLO26 BMCV Python 实现。RTSP 解码、YOLO前处理、TPU推理、画框和JPEG编码尽量使用BM1684X硬件加速。
+本项目内置 [sophgo/sophon-demo](https://github.com/sophgo/sophon-demo) 已验证提交中的最小YOLO26 BMCV运行文件，不需要另外克隆完整仓库。RTSP解码、YOLO前处理、TPU推理、画框和JPEG编码尽量使用BM1684X硬件加速。
 
 ## 1. 架构
 
@@ -53,6 +53,7 @@ src/fire_smoke_monitor/
   scheduler.py              多路固定延时调度
   writer.py                 BMCV画框与JPEG保存
   app.py / cli.py           应用生命周期和命令行
+  vendor/yolo26/            固定版本的官方YOLO26 BMCV运行文件和许可证
 tests/                       不依赖算能硬件的单元测试
 ```
 
@@ -98,7 +99,7 @@ PY
 
 `target` 应包含 `BM1684X`。
 
-## 4. 准备项目和官方YOLO26例程
+## 4. 准备项目
 
 假设本仓库已经位于盒子的 `/data` 分区，进入仓库后：
 
@@ -106,14 +107,10 @@ PY
 export PROJECT_ROOT="$(pwd)"
 cd "${PROJECT_ROOT}"
 
-mkdir -p vendor models/yolo26 datasets downloads output/detections logs
-
-git clone --branch release https://github.com/sophgo/sophon-demo.git \
-  vendor/sophon-demo
-git -C vendor/sophon-demo checkout dfe0dff31c21984b681536df9cb2b1ba6c96a8a4
+mkdir -p models/yolo26 datasets downloads output/detections logs
 ```
 
-该提交已经过本项目验证。升级 `sophon-demo` 前，应先在独立目录验证 `sample/YOLO26/python/yolo26_bmcv.py` 的接口和推理结果。
+项目已内置 `sophon-demo release@dfe0dff31c21984b681536df9cb2b1ba6c96a8a4` 的 `yolo26_bmcv.py`、`utils.py` 和BSD-2-Clause许可证。运行盒子不再需要 `vendor/sophon-demo` 目录。
 
 创建复用系统SDK包的虚拟环境：
 
@@ -132,12 +129,25 @@ export PYTHONPATH="${PROJECT_ROOT}/src:/opt/sophon/sophon-opencv-latest/opencv-p
 
 ## 5. 先用官方COCO模型验证链路
 
-进入官方例程并下载测试数据和BM1684X模型：
+使用算能 `dfss` 直接下载测试数据、COCO类别和BM1684X模型：
 
 ```bash
-cd "${PROJECT_ROOT}/vendor/sophon-demo/sample/YOLO26"
-chmod +x scripts/download.sh
-./scripts/download.sh
+cd "${PROJECT_ROOT}/downloads"
+
+"${PROJECT_ROOT}/.venv/bin/python" -m pip install dfss
+"${PROJECT_ROOT}/.venv/bin/python" -m dfss \
+  --url=open@sophgo.com:sophon-demo/YOLO26_det/BM1684X.tar.gz
+tar xf BM1684X.tar.gz
+cp BM1684X/yolo26s_fp16_1b.bmodel \
+  "${PROJECT_ROOT}/models/yolo26/"
+
+"${PROJECT_ROOT}/.venv/bin/python" -m dfss \
+  --url=open@sophgo.com:sophon-demo/common/coco.names
+cp coco.names "${PROJECT_ROOT}/models/yolo26/"
+
+"${PROJECT_ROOT}/.venv/bin/python" -m dfss \
+  --url=open@sophgo.com:sophon-demo/common/test.tar.gz
+tar xf test.tar.gz -C "${PROJECT_ROOT}/datasets"
 ```
 
 将下载得到的模型、COCO类别文件和测试图片放入本项目对应目录，例如：
@@ -152,9 +162,9 @@ datasets/test/dog.jpg
 
 ```bash
 cd "${PROJECT_ROOT}/output"
-PYTHONPATH=/opt/sophon/sophon-opencv-latest/opencv-python \
-"${PROJECT_ROOT}/.venv/bin/python" \
-  "${PROJECT_ROOT}/vendor/sophon-demo/sample/YOLO26/python/yolo26_bmcv.py" \
+PYTHONPATH="${PROJECT_ROOT}/src:/opt/sophon/sophon-opencv-latest/opencv-python" \
+"${PROJECT_ROOT}/.venv/bin/python" -m \
+  fire_smoke_monitor.vendor.yolo26.yolo26_bmcv \
   --input "${PROJECT_ROOT}/datasets/test" \
   --bmodel "${PROJECT_ROOT}/models/yolo26/yolo26s_fp16_1b.bmodel" \
   --dev_id 0 \
@@ -255,7 +265,6 @@ smoke
 ```yaml
 runtime:
   dev_id: 0
-  sophon_demo_root: ../vendor/sophon-demo
   output_root: ../output/detections
   decoder_queue_size: 2
   read_timeout_sec: 2
@@ -366,11 +375,10 @@ PYTHONPATH=src pytest -q
 
 - `No module named sophon.sail`：虚拟环境未继承系统SDK包，或SAIL没有安装到当前Python 3.8。
 - `No module named cv2`：将Sophon OpenCV Python目录加入 `PYTHONPATH`。
-- 配置检查提示官方文件不存在：`sophon_demo_root` 必须指向仓库根目录。
 - YOLO一直没有火烟框：先用官方静态图片程序验证BModel、类别文件顺序和阈值。
 - 单路RTSP反复重连：先用Sophon FFmpeg验证URL、认证、网络和编码格式。
 - 保存图片停止：检查 `/data` 剩余空间和 `min_free_disk_gb`。
 
 ## 12. 第三方代码边界
 
-本仓库只包含多路流调度、检测适配和保存逻辑。运行时动态加载外部 `sophon-demo` YOLO26文件；`sophon-demo`、Ultralytics、模型权重和数据集分别受其许可证约束，商用部署前应单独核对。
+本仓库包含多路流调度、检测适配、保存逻辑，以及运行所需的两个 `sophon-demo` YOLO26 Python文件。内置文件的来源提交、改动说明和BSD-2-Clause许可证位于 `src/fire_smoke_monitor/vendor/yolo26/`。Ultralytics、模型权重和数据集分别受其许可证约束，商用部署前应单独核对。

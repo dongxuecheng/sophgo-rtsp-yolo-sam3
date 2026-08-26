@@ -25,7 +25,6 @@ class CameraConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     dev_id: int
-    sophon_demo_root: Path
     output_root: Path
     decoder_queue_size: int
     read_timeout_sec: int
@@ -112,9 +111,6 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
 
     runtime = RuntimeConfig(
         dev_id=int(runtime_raw.get("dev_id", 0)),
-        sophon_demo_root=_path(
-            _required(runtime_raw, "sophon_demo_root", "runtime"), base_dir
-        ),
         output_root=_path(runtime_raw.get("output_root", "../output"), base_dir),
         decoder_queue_size=int(runtime_raw.get("decoder_queue_size", 2)),
         read_timeout_sec=int(runtime_raw.get("read_timeout_sec", 2)),
@@ -196,10 +192,6 @@ def load_config(path: Path) -> AppConfig:
 
 
 def validate_runtime_paths(config: AppConfig) -> None:
-    demo = config.runtime.sophon_demo_root
-    official_source = demo / "sample" / "YOLO26" / "python" / "yolo26_bmcv.py"
-    if not official_source.is_file():
-        raise ConfigError("sophon-demo 官方文件不存在: {}".format(official_source))
     if not config.yolo26.bmodel.is_file():
         raise ConfigError("YOLO26 BModel 不存在: {}".format(config.yolo26.bmodel))
     if not config.yolo26.class_names.is_file():

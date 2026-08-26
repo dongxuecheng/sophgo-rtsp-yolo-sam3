@@ -9,7 +9,6 @@ import numpy as np
 
 from .config import Yolo26Config
 from .domain import Detection
-from .official_loader import load_official_module
 
 
 logger = logging.getLogger(__name__)
@@ -20,15 +19,17 @@ class Yolo26Detector:
 
     name = "yolo26"
 
-    def __init__(self, config: Yolo26Config, demo_root: Path, dev_id: int) -> None:
-        source = demo_root / "sample" / "YOLO26" / "python" / "yolo26_bmcv.py"
-        module = load_official_module("fire_smoke_vendor_yolo26", source)
+    def __init__(self, config: Yolo26Config, dev_id: int) -> None:
+        # Import lazily so configuration tests do not require the SoC-only SAIL
+        # Python module. The implementation is pinned and bundled with this package.
+        from .vendor.yolo26.yolo26_bmcv import YOLO26
+
         args = SimpleNamespace(
             bmodel=str(config.bmodel),
             dev_id=dev_id,
             conf_thresh=config.conf_threshold,
         )
-        self._model = module.YOLO26(args)
+        self._model = YOLO26(args)
         self._class_names = self._read_class_names(config.class_names)
         name_to_id = {name: index for index, name in enumerate(self._class_names)}
         missing = [name for name in config.target_classes if name not in name_to_id]

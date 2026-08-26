@@ -37,7 +37,6 @@ class MonitorApplication:
 
             detector = Yolo26Detector(
                 config.yolo26,
-                config.runtime.sophon_demo_root,
                 config.runtime.dev_id,
             )
             self._detectors["yolo26"] = detector

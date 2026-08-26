@@ -15,7 +15,6 @@ def valid_data():
     return {
         "runtime": {
             "dev_id": 0,
-            "sophon_demo_root": "../vendor/sophon-demo",
             "output_root": "../output",
         },
         "cameras": [
@@ -98,15 +97,9 @@ def test_example_yaml_is_parseable():
     assert config.yolo26.enabled is True
 
 
-def test_runtime_path_check_does_not_import_hardware(tmp_path: Path):
+def test_runtime_path_check_only_requires_model_and_class_names(tmp_path: Path):
     data = valid_data()
     config = parse_config(data, tmp_path / "config")
-    official_source = (
-        config.runtime.sophon_demo_root
-        / "sample/YOLO26/python/yolo26_bmcv.py"
-    )
-    official_source.parent.mkdir(parents=True)
-    official_source.touch()
     config.yolo26.bmodel.parent.mkdir(parents=True)
     config.yolo26.bmodel.touch()
     config.yolo26.class_names.parent.mkdir(parents=True, exist_ok=True)

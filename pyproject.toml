@@ -22,5 +22,8 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"fire_smoke_monitor.vendor.yolo26" = ["LICENSE", "README.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

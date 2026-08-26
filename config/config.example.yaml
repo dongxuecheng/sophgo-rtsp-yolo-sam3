@@ -1,8 +1,6 @@
 runtime:
   dev_id: 0
-  # 建议固定到 README 指定的 sophon-demo release commit。
-  sophon_demo_root: /opt/sophon-demo
-  output_root: ../output
+  output_root: ../output/detections
   decoder_queue_size: 2
   # 调度器始终非阻塞；单路持续无有效帧达到该时间后，在后台重建该路解码器。
   read_timeout_sec: 2
