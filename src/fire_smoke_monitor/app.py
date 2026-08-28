@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Dict
 
 from .config import AppConfig
-from .domain import ModelRuntime
-from .models import Yolo26Detector
+from .encoding import JpegEncoder
 from .scheduler import InferenceScheduler
 from .streams import MultiRtspSource
-from .writer import DetectionWriter
+from .uploader import FrameUploader
 
 
 logger = logging.getLogger(__name__)
@@ -25,7 +23,8 @@ class MonitorApplication:
             ) from exc
 
         self._source = None
-        self._detectors: Dict[str, Any] = {}
+        self._detector = None
+        self._uploader = None
         self._scheduler = None
         self._closed = False
         try:
@@ -35,11 +34,20 @@ class MonitorApplication:
                 raise RuntimeError("当前设备不是 BM1684X: {}".format(target))
             logger.info("硬件设备已确认 dev_id=%d target=%s", config.runtime.dev_id, target)
 
-            detector = Yolo26Detector(
-                config.yolo26,
-                config.runtime.dev_id,
+            encoder = JpegEncoder(
+                sail, config.runtime.dev_id,
+                config.pipeline.max_image_bytes, config.pipeline.max_image_pixels,
             )
-            self._detectors["yolo26"] = detector
+            if config.yolo26 is not None:
+                from .models import Yolo26Detector
+
+                self._detector = Yolo26Detector(config.yolo26, config.runtime.dev_id)
+            else:
+                logger.info("定时直传模式：不加载 YOLO，不进行本地目标检测")
+
+            self._uploader = FrameUploader(
+                config.pipeline, [camera.camera_id for camera in config.cameras]
+            )
 
             self._source = MultiRtspSource(
                 sail,
@@ -49,24 +57,8 @@ class MonitorApplication:
                 config.runtime.read_timeout_sec,
                 config.runtime.reconnect_cooldown_sec,
             )
-            writer = DetectionWriter(
-                sail,
-                config.runtime.dev_id,
-                config.runtime.output_root,
-                config.runtime.min_free_disk_gb,
-            )
-            runtimes: Dict[str, ModelRuntime] = {
-                "yolo26": ModelRuntime(
-                    detector=self._detectors["yolo26"],
-                    interval_sec=config.yolo26.interval_sec,
-                    save_cooldown_sec=config.yolo26.save_cooldown_sec,
-                )
-            }
             self._scheduler = InferenceScheduler(
-                [camera.camera_id for camera in config.cameras],
-                runtimes,
-                self._source,
-                writer,
+                config, self._source, encoder, self._uploader, self._detector,
             )
         except Exception:
             self.close()
@@ -81,15 +73,19 @@ class MonitorApplication:
         if self._closed:
             return
         self._closed = True
+        if self._uploader is not None:
+            self._uploader.close()
+            self._uploader = None
         if self._source is not None:
             self._source.close()
             self._source = None
-        for name, detector in tuple(self._detectors.items()):
+        if self._detector is not None:
             try:
-                detector.close()
+                self._detector.close()
             except Exception:
-                logger.exception("关闭模型失败 model=%s", name)
-        self._detectors.clear()
+                logger.exception("关闭 YOLO 模型失败")
+            self._detector = None
+        self._scheduler = None
 
 
 def build_application(config: AppConfig) -> MonitorApplication:

@@ -1,0 +1,31 @@
+# 不进行本地 YOLO 推理；每路采样一张原图上传给远端 SAM3 + LLM 服务。
+mode: periodic
+
+pipeline:
+  endpoint: http://192.168.1.200:18080/v1/frames
+  machine_id: se7-01
+  api_key_env: ""
+  workers: 2
+  timeout_sec: 10
+  max_pending_age_sec: 30
+  max_image_bytes: 8388608
+  max_image_pixels: 16000000
+
+runtime:
+  dev_id: 0
+  decoder_queue_size: 2
+  read_timeout_sec: 2
+  reconnect_cooldown_sec: 10
+  log_level: INFO
+
+periodic:
+  interval_sec: 10
+
+cameras:
+  - id: camera_01
+    name: 仓库东门
+    url: rtsp://user:password@192.168.1.101:554/stream1
+  # - id: camera_02
+  #   name: 仓库西门
+  #   url: rtsp://user:password@192.168.1.102:554/stream1
+  #   interval_sec: 20

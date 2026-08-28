@@ -8,6 +8,8 @@ import threading
 from pathlib import Path
 from typing import Optional, Sequence
 
+import yaml
+
 from .app import build_application
 from .config import ConfigError, load_config, validate_runtime_paths
 
@@ -17,13 +19,13 @@ logger = logging.getLogger(__name__)
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="BM1684X 多路 RTSP 火焰/烟雾检测服务"
+        description="BM1684X 多路 RTSP 上传服务（YOLO 命中 / 定时直传）"
     )
     parser.add_argument("--config", required=True, help="YAML 配置文件")
     parser.add_argument(
         "--check-config",
         action="store_true",
-        help="只检查配置和本地模型文件，不初始化硬件",
+        help="只检查配置、密钥环境变量和所需模型文件，不初始化硬件或发 HTTP 请求",
     )
     return parser
 
@@ -43,10 +45,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         validate_runtime_paths(config)
         if args.check_config:
             logger.info(
-                "配置检查通过 cameras=%d model=yolo26",
-                len(config.cameras),
+                "配置检查通过 cameras=%d mode=%s yolo26=%s local_save=disabled",
+                len(config.cameras), config.mode, config.yolo26 is not None,
             )
             return 0
+    except yaml.YAMLError:
+        # YAML parser diagnostics may embed a line containing an RTSP password.
+        logging.basicConfig(level=logging.ERROR, format="%(levelname)s: %(message)s")
+        logger.error("配置检查失败：YAML 语法错误，请检查缩进和引号")
+        return 2
     except (ConfigError, ValueError, OSError) as exc:
         logging.basicConfig(level=logging.ERROR, format="%(levelname)s: %(message)s")
         logger.error("配置检查失败: %s", exc)

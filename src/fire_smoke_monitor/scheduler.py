@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import logging
 import threading
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Optional
 
-from .domain import ModelRuntime
+from .config import AppConfig, CameraConfig
+from .domain import UploadFrame
 from .streams import FrameUnavailableError
 
 
@@ -15,97 +17,79 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _Job:
-    model_name: str
-    camera_id: str
+    camera: CameraConfig
+    interval_sec: float
     next_due: float
 
 
 class InferenceScheduler:
-    """Serial TPU scheduler for independently sampled camera streams."""
+    """Single hardware thread; HTTP is always handled by the background uploader."""
 
     def __init__(
-        self,
-        camera_ids: Sequence[str],
-        models: Mapping[str, ModelRuntime],
-        source: Any,
-        writer: Any,
+        self, config: AppConfig, source: Any, encoder: Any, uploader: Any,
+        detector: Optional[Any] = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._models: Dict[str, ModelRuntime] = dict(models)
+        if (config.mode == "yolo_trigger") != (detector is not None):
+            raise ValueError("YOLO 检测器必须与 mode 一致")
+        self._mode = config.mode
         self._source = source
-        self._writer = writer
+        self._encoder = encoder
+        self._uploader = uploader
+        self._detector = detector
         self._clock = clock
-        start = clock()
-        self._jobs: List[_Job] = [
-            _Job(model_name=model_name, camera_id=camera_id, next_due=start)
-            for model_name in self._models
-            for camera_id in camera_ids
-        ]
+        now = clock()
+        self._jobs = [_Job(camera, config.interval_for(camera), now) for camera in config.cameras]
 
     def run(self, stop_event: threading.Event) -> None:
-        logger.info("推理调度已启动 models=%s", ",".join(self._models))
+        logger.info("取帧调度已启动 mode=%s cameras=%d local_save=disabled",
+                    self._mode, len(self._jobs))
         while not stop_event.is_set():
-            work_count = self.run_iteration()
-            if work_count:
+            if self.run_iteration(stop_event):
                 continue
-            wait_sec = self._seconds_until_next_job()
-            stop_event.wait(min(max(wait_sec, 0.01), 0.5))
-        logger.info("推理调度已停止")
+            delay = min(job.next_due for job in self._jobs) - self._clock()
+            stop_event.wait(max(0.01, min(0.5, delay)))
 
-    def run_iteration(self) -> int:
+    def run_iteration(self, stop_event: Optional[threading.Event] = None) -> int:
         now = self._clock()
-        due_jobs = sorted(
-            (job for job in self._jobs if job.next_due <= now),
-            key=lambda job: job.next_due,
-        )
-        for job in due_jobs:
+        due = sorted((job for job in self._jobs if job.next_due <= now),
+                     key=lambda job: job.next_due)
+        count = 0
+        for job in due:
+            if stop_event is not None and stop_event.is_set():
+                break
             self._run_job(job)
-        return len(due_jobs)
+            count += 1
+        return count
 
     def _run_job(self, job: _Job) -> None:
-        runtime = self._models[job.model_name]
+        camera = job.camera
         started = self._clock()
         try:
-            image = self._source.read(job.camera_id)
-            detections = runtime.detector.detect(image)
-            saved = self._writer.save(
-                job.model_name,
-                job.camera_id,
-                image,
-                detections,
-                runtime.save_cooldown_sec,
-            )
-            if detections:
-                logger.info(
-                    "检测命中 model=%s camera=%s count=%d saved=%s elapsed=%.3fs",
-                    job.model_name,
-                    job.camera_id,
-                    len(detections),
-                    str(saved) if saved is not None else "cooldown/disk-guard",
-                    self._clock() - started,
-                )
+            image = self._source.read(camera.camera_id)
+            # Host sampling time, not a camera PTS or an HTTP-send timestamp.
+            captured_at = datetime.now(timezone.utc)
+            frame_time = self._clock()
+            detections = []
+            if self._detector is not None:
+                detections = self._detector.detect(image)
+                if not detections:
+                    logger.debug("YOLO 未命中 camera=%s", camera.camera_id)
+                    return
+            jpeg = self._encoder.encode(image)
+            state = self._uploader.submit(UploadFrame(
+                camera.camera_id, camera.name, captured_at, frame_time, jpeg,
+            ))
+            if state == "stopped":
+                logger.error("上传器已停止，当前帧未提交 camera=%s", camera.camera_id)
             else:
-                logger.debug(
-                    "未命中 model=%s camera=%s elapsed=%.3fs",
-                    job.model_name,
-                    job.camera_id,
-                    self._clock() - started,
-                )
-        except FrameUnavailableError as exc:
-            logger.debug(
-                "跳过当前无帧任务 model=%s camera=%s reason=%s",
-                job.model_name,
-                job.camera_id,
-                exc,
-            )
+                logger.info("图片待上传 mode=%s camera=%s targets=%d queue=%s bytes=%d elapsed=%.3fs",
+                            self._mode, camera.camera_id, len(detections),
+                            state, len(jpeg), self._clock() - started)
+        except FrameUnavailableError:
+            logger.debug("跳过无帧摄像头 camera=%s", camera.camera_id)
         except Exception:
-            logger.exception("推理任务失败 model=%s camera=%s", job.model_name, job.camera_id)
+            logger.exception("当前帧处理失败 camera=%s mode=%s", camera.camera_id, self._mode)
         finally:
-            # Fixed-delay scheduling avoids catch-up bursts after inference or
-            # a temporarily unavailable stream.
-            job.next_due = self._clock() + runtime.interval_sec
-
-    def _seconds_until_next_job(self) -> float:
-        if not self._jobs:
-            return 0.5
-        return min(job.next_due for job in self._jobs) - self._clock()
+            # Fixed delay: no replay/catch-up even if hardware work was slow.
+            job.next_due = self._clock() + job.interval_sec

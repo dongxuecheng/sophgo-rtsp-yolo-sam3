@@ -1,4 +1,4 @@
 # sophon-sail 和 sophon-opencv 必须使用算能 SDK/SoC 系统自带版本，不能用 pip 覆盖。
 numpy>=1.24,<2.0
 PyYAML>=6,<7
-
+httpx==0.27.2

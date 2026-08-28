@@ -1,17 +1,20 @@
 [Unit]
-Description=BM1684X Fire and Smoke Monitor
+Description=BM1684X RTSP Frame Uploader
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=linaro
-WorkingDirectory=/opt/fire-smoke-monitor
-ExecStart=/opt/fire-smoke-monitor/.venv/bin/python -m fire_smoke_monitor --config /opt/fire-smoke-monitor/config/config.yaml
+WorkingDirectory=/data/sophgo-rtsp-yolo-sam3
+ExecStart=/data/sophgo-rtsp-yolo-sam3/.venv/bin/python -m fire_smoke_monitor --config /data/sophgo-rtsp-yolo-sam3/config/config.yaml
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/data/sophgo-rtsp-yolo-sam3/src:/opt/sophon/sophon-opencv-latest/opencv-python
+EnvironmentFile=-/data/sophgo-rtsp-yolo-sam3/config/pipeline.env
+UMask=0077
+TimeoutStopSec=45
 
 [Install]
 WantedBy=multi-user.target
-

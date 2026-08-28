@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -17,10 +17,11 @@ class Detection:
 
 
 @dataclass(frozen=True)
-class ModelRuntime:
-    """Detector plus the small amount of scheduling policy it needs."""
+class UploadFrame:
+    """Only compressed bytes cross into the HTTP thread; no device memory."""
 
-    detector: Any
-    interval_sec: float
-    save_cooldown_sec: float
-
+    camera_id: str
+    stream_name: str
+    captured_at: datetime
+    created_monotonic: float
+    jpeg: bytes = field(repr=False)

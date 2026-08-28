@@ -6,3 +6,9 @@ __pycache__/
 .venv/
 output/
 config/config.yaml
+config/config.*.yaml
+!config/config.example.yaml
+!config/config.periodic.example.yaml
+config/pipeline.env
+logs/
+.uv-cache/
