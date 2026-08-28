@@ -25,6 +25,9 @@ runtime:
   # 单路解码器重建尝试间隔，同时也是无帧告警冷却时间。
   reconnect_cooldown_sec: 10
   log_level: INFO
+  log_dir: ../logs
+  # 含当天，最多保留最近 30 个自然日；可设为 1-30。
+  log_retention_days: 30
 
 cameras:
   - id: camera_01

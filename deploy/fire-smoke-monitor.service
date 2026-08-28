@@ -7,12 +7,9 @@ Wants=network-online.target
 Type=simple
 User=linaro
 WorkingDirectory=/data/sophgo-rtsp-yolo-sam3
-ExecStart=/data/sophgo-rtsp-yolo-sam3/.venv/bin/python -m fire_smoke_monitor --config /data/sophgo-rtsp-yolo-sam3/config/config.yaml
+ExecStart=/bin/bash /data/sophgo-rtsp-yolo-sam3/start.sh config/config.yaml --no-console
 Restart=always
 RestartSec=5
-Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONPATH=/data/sophgo-rtsp-yolo-sam3/src:/opt/sophon/sophon-opencv-latest/opencv-python
-EnvironmentFile=-/data/sophgo-rtsp-yolo-sam3/config/pipeline.env
 UMask=0077
 TimeoutStopSec=45
 

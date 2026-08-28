@@ -17,6 +17,8 @@ runtime:
   read_timeout_sec: 2
   reconnect_cooldown_sec: 10
   log_level: INFO
+  log_dir: ../logs
+  log_retention_days: 30
 
 periodic:
   interval_sec: 10

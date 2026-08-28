@@ -83,7 +83,8 @@ class InferenceScheduler:
             if state == "stopped":
                 logger.error("上传器已停止，当前帧未提交 camera=%s", camera.camera_id)
             else:
-                logger.info("图片待上传 mode=%s camera=%s targets=%d queue=%s bytes=%d elapsed=%.3fs",
+                log = logger.warning if state == "replaced" else logger.debug
+                log("图片待上传 mode=%s camera=%s targets=%d queue=%s bytes=%d elapsed=%.3fs",
                             self._mode, camera.camera_id, len(detections),
                             state, len(jpeg), self._clock() - started)
         except FrameUnavailableError:

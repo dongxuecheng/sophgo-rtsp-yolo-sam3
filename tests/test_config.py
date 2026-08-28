@@ -159,7 +159,7 @@ def test_reject_invalid_pipeline_options(tmp_path, key, value):
         parse_config(data, tmp_path)
 
 
-def test_api_key_is_resolved_only_from_environment(tmp_path, monkeypatch):
+def test_api_key_is_resolved_from_environment_without_exposing_it(tmp_path, monkeypatch):
     data = valid_data()
     data["mode"] = "periodic"
     data["pipeline"]["api_key_env"] = "TEST_PIPELINE_KEY"
@@ -188,3 +188,38 @@ def test_legacy_save_fields_are_ignored_with_warning(tmp_path, caplog):
     config = parse_config(data, tmp_path)
     assert not hasattr(config.runtime, "output_root")
     assert "已停用" in caplog.text
+
+
+def test_log_defaults_and_retention_limit(tmp_path):
+    data = valid_data()
+    config = parse_config(data, tmp_path / "config")
+    assert config.runtime.log_dir == (tmp_path / "logs").resolve()
+    assert config.runtime.log_retention_days == 30
+    for days in (0, 31, -1, 1.5, True):
+        data["runtime"]["log_retention_days"] = days
+        with pytest.raises(ConfigError, match="log_retention_days"):
+            parse_config(data, tmp_path)
+
+
+def test_key_file_is_literal_environment_takes_precedence(tmp_path, monkeypatch):
+    data = valid_data()
+    data["mode"] = "periodic"
+    data["pipeline"]["api_key_env"] = "TEST_KEY"
+    monkeypatch.delenv("TEST_KEY", raising=False)
+    path = tmp_path / "pipeline.env"
+    path.write_text('# comment\nTEST_KEY="literal-$HOME-$(hostname)"\n', encoding="utf-8")
+    config = parse_config(data, tmp_path)
+    assert config.pipeline.api_key() == "literal-$HOME-$(hostname)"
+    assert "TEST_KEY" not in __import__("os").environ  # no environment mutation
+    monkeypatch.setenv("TEST_KEY", "environment-value")
+    assert config.pipeline.api_key() == "environment-value"
+
+
+@pytest.mark.parametrize("contents", ['TEST_KEY="unclosed\n', 'TEST_KEY=one\nTEST_KEY=two\n'])
+def test_invalid_key_file_is_rejected_without_leaking_secret(tmp_path, monkeypatch, contents):
+    data = valid_data()
+    data["pipeline"]["api_key_env"] = "TEST_KEY"
+    monkeypatch.delenv("TEST_KEY", raising=False)
+    (tmp_path / "pipeline.env").write_text(contents, encoding="utf-8")
+    with pytest.raises(ConfigError, match="pipeline.env"):
+        parse_config(data, tmp_path).pipeline.api_key()

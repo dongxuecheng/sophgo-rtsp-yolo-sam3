@@ -178,8 +178,8 @@ class FrameUploader:
                     continue
                 # Total deadline includes connection, upload AND response reading.
                 await asyncio.wait_for(client.upload(frame), timeout=self._config.timeout_sec)
-                logger.info("远端已接收 camera=%s status=202 elapsed=%.3fs",
-                            frame.camera_id, self._clock() - started)
+                logger.info("远端已接收 camera=%s status=202 bytes=%d queue_wait=%.3fs elapsed=%.3fs",
+                            frame.camera_id, len(frame.jpeg), age, self._clock() - started)
             except asyncio.TimeoutError:
                 logger.warning("上传超时，不补发 camera=%s timeout=%.1fs",
                                frame.camera_id, self._config.timeout_sec)

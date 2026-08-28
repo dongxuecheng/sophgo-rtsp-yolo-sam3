@@ -36,6 +36,8 @@ class RuntimeConfig:
     read_timeout_sec: int
     reconnect_cooldown_sec: float
     log_level: str
+    log_dir: Path
+    log_retention_days: int
 
 
 @dataclass(frozen=True)
@@ -57,13 +59,16 @@ class PipelineConfig:
     max_pending_age_sec: float
     max_image_bytes: int
     max_image_pixels: int
+    env_file: Optional[Path] = None
 
     def api_key(self) -> str:
         if not self.api_key_env:
             return ""
         value = os.environ.get(self.api_key_env, "")
+        if not value and self.env_file is not None and self.env_file.is_file():
+            value = _read_env_value(self.env_file, self.api_key_env)
         if not value:
-            raise ConfigError("请设置上传密钥环境变量 {}".format(self.api_key_env))
+            raise ConfigError("请设置 {} 环境变量或配置目录中的 pipeline.env".format(self.api_key_env))
         if not all(32 < ord(char) < 127 for char in value):
             raise ConfigError("上传密钥必须是无空白的可打印 ASCII 字符")
         return value
@@ -142,7 +147,28 @@ def _identifier(value: Any, name: str) -> str:
     return result
 
 
-def _pipeline_config(raw: Mapping[str, Any]) -> PipelineConfig:
+def _read_env_value(path: Path, name: str) -> str:
+    """Read one literal KEY=value; never execute shell code or expand variables."""
+    found = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator or key.strip() != name:
+            continue
+        if found is not None:
+            raise ConfigError("pipeline.env 中密钥变量重复")
+        value = value.strip()
+        if value[:1] in {"'", '"'}:
+            if len(value) < 2 or value[-1] != value[0]:
+                raise ConfigError("pipeline.env 中密钥引号未闭合")
+            value = value[1:-1]
+        found = value
+    return found or ""
+
+
+def _pipeline_config(raw: Mapping[str, Any], base_dir: Path) -> PipelineConfig:
     endpoint = str(_required(raw, "endpoint", "pipeline")).strip()
     try:
         url = urlsplit(endpoint)
@@ -175,6 +201,7 @@ def _pipeline_config(raw: Mapping[str, Any]) -> PipelineConfig:
         max_image_pixels=_integer(
             raw.get("max_image_pixels", 16000000), "pipeline.max_image_pixels", 1, 64000000
         ),
+        env_file=base_dir / "pipeline.env",
     )
 
 
@@ -196,10 +223,16 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
             runtime_raw.get("reconnect_cooldown_sec", 10), "runtime.reconnect_cooldown_sec"
         ),
         log_level=str(runtime_raw.get("log_level", "INFO")).upper(),
+        log_dir=_path(runtime_raw.get("log_dir", "../logs"), base_dir),
+        log_retention_days=_integer(
+            runtime_raw.get("log_retention_days", 30), "runtime.log_retention_days", 1, 30
+        ),
     )
     if runtime.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
         raise ConfigError("runtime.log_level 仅支持 DEBUG/INFO/WARNING/ERROR")
-    pipeline = _pipeline_config(_mapping(_required(root, "pipeline", "root"), "pipeline"))
+    if runtime.log_dir.parent == runtime.log_dir:
+        raise ConfigError("runtime.log_dir 不能是文件系统根目录")
+    pipeline = _pipeline_config(_mapping(_required(root, "pipeline", "root"), "pipeline"), base_dir)
 
     camera_items = _sequence(_required(root, "cameras", "root"), "cameras")
     if not 1 <= len(camera_items) <= MAX_CAMERAS:
