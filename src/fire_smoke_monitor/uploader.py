@@ -22,6 +22,28 @@ class UploadError(RuntimeError):
     """A safe error message without URLs, credentials or remote response text."""
 
 
+def _consume_task_exception(task: asyncio.Task) -> None:
+    """Always retrieve a child task exception, including Python 3.8 timeout races."""
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        pass
+
+
+async def _await_upload(awaitable, timeout_sec: float) -> None:
+    """Apply one total deadline and deterministically reap the upload task."""
+    task = asyncio.ensure_future(awaitable)
+    task.add_done_callback(_consume_task_exception)
+    try:
+        await asyncio.wait_for(task, timeout=timeout_sec)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 class PipelineClient:
     def __init__(self, config: PipelineConfig, http: httpx.AsyncClient, api_key: str):
         self._config = config
@@ -141,7 +163,11 @@ class FrameUploader:
         self._wake = asyncio.Event()
         self._stop = asyncio.Event()
         async with httpx.AsyncClient(
-            timeout=self._config.timeout_sec, trust_env=False, follow_redirects=False,
+            # One outer deadline below covers pool wait, connect, request body,
+            # response headers and response body. A second identical HTTPX
+            # deadline can race asyncio.wait_for on Python 3.8 and leave an
+            # exception reported as "Task exception was never retrieved".
+            timeout=None, trust_env=False, follow_redirects=False,
             limits=httpx.Limits(max_connections=self._config.workers,
                                max_keepalive_connections=self._config.workers),
             transport=self._transport,
@@ -213,7 +239,9 @@ class FrameUploader:
                     logger.warning("丢弃过期待传帧 camera=%s age=%.1fs", frame.camera_id, age)
                     continue
                 # Total deadline includes connection, upload AND response reading.
-                await asyncio.wait_for(client.upload(frame), timeout=self._config.timeout_sec)
+                await _await_upload(
+                    client.upload(frame), timeout_sec=self._config.timeout_sec
+                )
                 if self._health is not None:
                     self._health.recover("remote")
                 logger.info("远端已接收 camera=%s status=202 bytes=%d queue_wait=%.3fs elapsed=%.3fs",
@@ -221,8 +249,17 @@ class FrameUploader:
             except asyncio.TimeoutError:
                 if self._health is not None:
                     self._health.degrade("remote", "timeout")
-                logger.warning("上传超时，不补发 camera=%s timeout=%.1fs",
-                               frame.camera_id, self._config.timeout_sec)
+                logger.warning(
+                    "上传超时，不补发 camera=%s scope=total timeout=%.1fs",
+                    frame.camera_id, self._config.timeout_sec,
+                )
+            except httpx.TimeoutException as exc:
+                if self._health is not None:
+                    self._health.degrade("remote", "timeout")
+                logger.warning(
+                    "上传超时，不补发 camera=%s scope=httpx error=%s",
+                    frame.camera_id, type(exc).__name__,
+                )
             except UploadError as exc:
                 if self._health is not None:
                     self._health.degrade("remote", "rejected")

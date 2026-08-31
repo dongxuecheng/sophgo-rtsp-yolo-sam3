@@ -14,7 +14,12 @@ import pytest
 from fire_smoke_monitor.config import PipelineConfig
 from fire_smoke_monitor.domain import UploadFrame
 from fire_smoke_monitor.health import HealthRegistry
-from fire_smoke_monitor.uploader import FrameUploader, PipelineClient, UploadError
+from fire_smoke_monitor.uploader import (
+    FrameUploader,
+    PipelineClient,
+    UploadError,
+    _await_upload,
+)
 
 
 def config(**overrides):
@@ -57,6 +62,31 @@ def wait_for(predicate, timeout=2):
 async def wait_event(event):
     while not event.is_set():
         await asyncio.sleep(0.005)
+
+
+def test_upload_timeout_race_always_retrieves_child_exception():
+    """Python 3.8 wait_for may hide an exception raised during cancellation."""
+    contexts = []
+
+    async def cancellation_race():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise httpx.WriteTimeout("")
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda current_loop, context: contexts.append(context))
+        try:
+            with pytest.raises((asyncio.TimeoutError, httpx.WriteTimeout)):
+                await _await_upload(cancellation_race(), 0.01)
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous)
+
+    asyncio.run(run())
+    assert not contexts
 
 
 def test_multipart_contract_key_original_image_and_aware_timestamp():
@@ -187,6 +217,28 @@ def test_total_timeout_releases_worker_and_next_cycle_recovers(caplog):
         assert recovered.wait(2)
         assert len(calls) == 2
         assert "上传超时" in caplog.text
+    finally:
+        uploader.close()
+
+
+def test_httpx_phase_timeout_is_logged_once_and_worker_continues(caplog):
+    calls = []
+
+    async def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.WriteTimeout("")
+        return reply()
+
+    uploader = FrameUploader(
+        config(workers=1), ["cam1"], transport=httpx.MockTransport(handler)
+    )
+    try:
+        uploader.submit(frame())
+        wait_for(lambda: "scope=httpx error=WriteTimeout" in caplog.text)
+        uploader.submit(frame(jpeg=b"fresh"))
+        wait_for(lambda: len(calls) == 2)
+        assert "Task exception was never retrieved" not in caplog.text
     finally:
         uploader.close()
 
