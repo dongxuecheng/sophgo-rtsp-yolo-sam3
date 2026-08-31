@@ -28,6 +28,20 @@ runtime:
   log_dir: ../logs
   # 含当天，最多保留最近 30 个自然日；可设为 1-30。
   log_retention_days: 30
+  # 单个日志和全部 monitor-*.log 的容量上限；日志轮转不会删除非本项目文件。
+  log_max_file_mb: 100
+  log_max_total_mb: 1024
+  # /data 剩余空间低于该值时删除旧日志，并暂停 DEBUG/INFO 文件日志。
+  min_free_disk_gb: 5
+  disk_check_interval_sec: 60
+
+health:
+  # 取帧/检测/JPEG 编码连续内部异常达到阈值后退出，由 systemd 重启。
+  # 摄像头离线、远端接口超时/失败不计入该阈值。
+  max_consecutive_processing_failures: 10
+  # 主调度器或上传事件循环超过该时间无心跳，停止喂 systemd watchdog。
+  scheduler_stall_sec: 30
+  status_log_interval_sec: 300
 
 cameras:
   - id: camera_01

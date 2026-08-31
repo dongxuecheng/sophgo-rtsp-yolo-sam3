@@ -69,7 +69,16 @@ pipeline:
 runtime:
   log_dir: ../logs
   log_retention_days: 30
+  log_max_file_mb: 100
+  log_max_total_mb: 1024
+  min_free_disk_gb: 5
+  disk_check_interval_sec: 60
   log_level: INFO
+
+health:
+  max_consecutive_processing_failures: 10
+  scheduler_stall_sec: 30
+  status_log_interval_sec: 300
 
 periodic:
   interval_sec: 10
@@ -90,8 +99,8 @@ cameras:
 - `runtime.dev_id` 默认 0，`decoder_queue_size` 默认 2；持续无帧超过 `read_timeout_sec`（默认 2）后，仅后台重建该路，重试间隔 `reconnect_cooldown_sec` 默认 10 秒。
 - `periodic` 忽略整个 `models`。YOLO 命中多个框也只上传一张原图，本地漏检会挡住后续复核。
 - 原图不缩放；默认最大 8 MiB、1600 万像素。超限时跳过并记日志，可降低摄像头子码流分辨率。调整 `max_image_bytes/max_image_pixels` 须同步远端限制。
-- 相对模型/日志路径以 YAML 所在目录为基准。旧配置不添加日志字段也会默认使用同级上层的 `logs/` 和 30 天保留期。
-- 旧 `output_root/min_free_disk_gb/save_cooldown_sec` 已停用；不会转换成上传冷却。两种模式都不写检测图片。
+- 相对模型/日志路径以 YAML 所在目录为基准。旧配置不添加新增字段时使用安全默认值：30 天、单文件 100 MiB、日志总量 1 GiB、日志所在文件系统至少保留 5 GiB。
+- 旧 `output_root/save_cooldown_sec` 已停用；不会转换成上传冷却。`min_free_disk_gb` 现在用于日志磁盘保护，两种模式仍不写检测图片。
 
 ### 密钥
 
@@ -110,20 +119,22 @@ chmod 600 config/pipeline.env
 只读取指定密钥的字面量 `KEY=value`（可带成对引号），不执行 shell、不展开 $变量，不支持同行注释。
 远端没有鉴权则保持 `api_key_env: ""`，不需要该文件。
 
-## 日志：自动保留最近 30 天
+## 日志与磁盘保护
 
 默认自动写入 `logs/monitor-YYYY-MM-DD.log`（UTF-8），新文件权限为 0600。
 包含 Python 业务日志、异常堆栈及 SAIL/FFmpeg 的 stdout/stderr，前台同时显示，无需 `tee`。
 
-- 按盒子本地日期分文件，同一天重启继续追加，不覆盖。
+- 按盒子本地日期分文件，同一天重启继续追加；达到 `log_max_file_mb` 后轮转为同日分段文件，不覆盖。
 - 保留当天及之前 29 天；`log_retention_days` 可设 1–30，不允许超过 30。
-- 启动立即清理过期文件；运行中跨天轮转，空闲时每分钟检查。停机期间不执行清理，下次启动时清理。
-- 只管理本日志目录内的普通 `monitor-YYYY-MM-DD.log` 文件，不递归、不跟随符号链接，不误删其他文件。
+- `log_max_total_mb` 限制所有受管日志的合计容量，默认 1024 MiB；超过时优先删除最旧分段。
+- `min_free_disk_gb` 检查 `log_dir` 所在文件系统。空间不足时先删最旧受管日志；仍不足则进入紧急模式，暂停 DEBUG/INFO 文件日志，ERROR 仍尝试落盘；空间恢复并留出迟滞余量后自动恢复。
+- 启动立即执行清理；运行中跨天轮转，并按 `disk_check_interval_sec` 检查。停机期间不执行清理，下次启动时补做。
+- 只管理本日志目录内名称严格匹配 `monitor-YYYY-MM-DD.log` 或 `monitor-YYYY-MM-DD.NNN.log` 的普通文件，不递归、不跟随符号链接，不误删模型、配置及其他日志。
 - 旧手工 `tee` 日志、历史图片和模型不在自动清理范围；已过期的受管日志会永久删除，没有回收站。
-- 日期依赖盒子系统时间，请校准时钟。30 天是时间限制，不是磁盘容量上限，仍应关注磁盘剩余空间。
+- 日期依赖盒子系统时间，请校准时钟。容量与余量保护只约束本项目日志，无法清理由其他程序占用的空间，仍应监控整个 `/data`。
 - RTSP URL 和已配置 API 密钥会在输出前脱敏；分享日志前仍建议检查其他业务信息。
 - INFO 保留启动/停止、每次远端接收和异常；抑制重复 HTTPX 请求日志。每帧入队/编码详情在 DEBUG；替换待传帧仍为 WARNING。
-- 写盘/清理异常会向终端或 journal 限频报告，不递归刷屏。需要检查空间/权限，不能把无日志视作服务正常。
+- 连续相同的 SAIL/FFmpeg 原生日志会合并，避免故障时刷爆磁盘。写盘/清理异常向终端或 journal 限频报告，不递归刷屏；不能把无日志视作服务正常。
 
 ```bash
 tail -F "logs/monitor-$(date +%F).log"
@@ -148,6 +159,18 @@ JPEG 通过 `Bmcv.imencode` 调用 Sophon OpenCV，JPU 是否实际启用需在�
 HTTP 并发默认 2（可设 1–8），超时覆盖整个请求；所有上传名额占满时其他路需排队，但不阻塞取帧/推理。
 超时、429、503 等不补发旧图；下一次采样继续，网络恢复后自动恢复。待传图过期或程序退出时丢弃，没有磁盘补发队列。
 
+### 健康检查与自动恢复边界
+
+进程持续检查主调度器心跳、HTTP 上传事件循环、所有 RTSP 监督线程、日志维护线程和原生日志采集线程。
+
+- 摄像头离线/无帧：只把该路标记为降级，后台继续重连，不影响其他路，不重启进程。
+- 远端接口超时、拒绝或网络中断：标记远端降级，丢弃当前帧，后续周期继续尝试，不重启进程。
+- 取帧以外的本地处理（YOLO、JPEG、提交队列）连续异常达到 `max_consecutive_processing_failures`：进程以失败状态退出，由 systemd 重启；任意一次完整处理成功会把连续计数清零。
+- 调度器/上传循环超过 `scheduler_stall_sec` 无心跳，或 RTSP、上传、日志内部线程意外退出：判定致命故障，停止 watchdog 心跳并请求退出。
+- 磁盘余量不足：健康状态显示 `degraded: disk`，启用日志紧急模式；本身不重启服务，避免重启风暴。
+
+健康状态会写入项目日志，同时通过 systemd `STATUS` 暴露；状态只含组件名，不包含 RTSP 地址、接口地址或密钥。
+
 接口为 `POST /v1/frames`，multipart 字段：`image`、`machine_id`、`stream_id`、`stream_name`、`captured_at`。
 不发送 RTSP 地址；`captured_at` 是盒子读取帧时的带时区 UTC 时间，不是摄像头曝光时间。
 `202 + accepted=true` 只表示远端入队，不表示确认火烟或保存证据。没有任务查询，也不等待 SAM3/LLM。
@@ -158,6 +181,7 @@ HTTPX 禁用环境代理和重定向，保留 HTTPS 证书校验；HTTP 明文�
 `deploy/fire-smoke-monitor.service` 默认读取 `config/config.yaml`。
 若使用 `config/config.periodic.yaml`，先把服务文件 `ExecStart` 中的配置参数改为该路径，不必覆盖原配置。
 服务使用相同启动脚本，并通过 `--no-console` 避免把正常运行日志再复制到 journal。
+单元采用 `Type=notify` 和 `WatchdogSec=60`：程序完成硬件/线程初始化后才报告 READY，只有内部组件健康时才发送 watchdog 心跳；进程卡死或停止喂狗后 systemd 会终止并重新启动。
 启动前的脚本/配置错误和日志写盘错误仍可查看 journal（其保留期由系统管理）。
 
 ```bash
@@ -168,9 +192,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now fire-smoke-monitor
 sudo systemctl status fire-smoke-monitor --no-pager -l
 journalctl -u fire-smoke-monitor -n 50 --no-pager
+systemctl show fire-smoke-monitor -p ActiveState -p SubState -p StatusText -p NRestarts
 ```
 
-修改配置/密钥后 `sudo systemctl restart fire-smoke-monitor`。
+修改代码、配置、密钥或 service 文件后，先执行配置检查；service 文件有变化时重新复制并 `daemon-reload`，然后 `sudo systemctl restart fire-smoke-monitor`。
 服务异常会重启；停止时关闭解码、取消上传并释放模型，不补发待传帧。远端已接收的图仍可能继续处理。
 
 ## 排查与开发

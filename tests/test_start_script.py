@@ -107,3 +107,12 @@ def test_default_start_forwards_console_option(shell_project):
     assert result.returncode == 0, result.stderr
     assert "ARG=config/config.yaml" in result.stdout
     assert "ARG=--no-console" in result.stdout
+
+
+def test_systemd_unit_enables_notify_watchdog_and_restart():
+    unit = (Path(__file__).resolve().parents[1] /
+            "deploy/fire-smoke-monitor.service").read_text(encoding="utf-8")
+    assert "Type=notify" in unit
+    assert "NotifyAccess=main" in unit
+    assert "WatchdogSec=60" in unit
+    assert "Restart=always" in unit

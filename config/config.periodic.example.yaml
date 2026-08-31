@@ -19,6 +19,15 @@ runtime:
   log_level: INFO
   log_dir: ../logs
   log_retention_days: 30
+  log_max_file_mb: 100
+  log_max_total_mb: 1024
+  min_free_disk_gb: 5
+  disk_check_interval_sec: 60
+
+health:
+  max_consecutive_processing_failures: 10
+  scheduler_stall_sec: 30
+  status_log_interval_sec: 300
 
 periodic:
   interval_sec: 10

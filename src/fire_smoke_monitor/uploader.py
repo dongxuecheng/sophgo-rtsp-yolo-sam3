@@ -12,6 +12,7 @@ import httpx
 
 from .config import PipelineConfig
 from .domain import UploadFrame
+from .health import HealthRegistry
 
 
 logger = logging.getLogger(__name__)
@@ -71,11 +72,13 @@ class FrameUploader:
         self, config: PipelineConfig, camera_ids: Sequence[str],
         clock: Callable[[], float] = time.monotonic,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        health: Optional[HealthRegistry] = None,
     ):
         self._config = config
         self._camera_ids = frozenset(camera_ids)
         self._clock = clock
         self._transport = transport
+        self._health = health
         self._api_key = config.api_key()
         self._lock = threading.Lock()
         self._pending: OrderedDict[str, UploadFrame] = OrderedDict()
@@ -123,6 +126,10 @@ class FrameUploader:
         except Exception as exc:
             self._startup_error = type(exc).__name__
             logger.error("上传线程异常退出 error=%s", self._startup_error)
+            with self._lock:
+                expected_stop = self._closed
+            if self._health is not None and not expected_stop:
+                self._health.fatal("uploader_thread_{}".format(type(exc).__name__))
         finally:
             with self._lock:
                 self._closed = True
@@ -142,6 +149,9 @@ class FrameUploader:
             client = PipelineClient(self._config, http, self._api_key)
             workers = [asyncio.create_task(self._worker(client))
                        for _ in range(self._config.workers)]
+            heartbeat = asyncio.create_task(self._heartbeat())
+            for task in workers + [heartbeat]:
+                task.add_done_callback(self._task_done)
             self._ready.set()
             with self._lock:
                 if self._closed:
@@ -151,7 +161,33 @@ class FrameUploader:
             finally:
                 for worker in workers:
                     worker.cancel()
-                await asyncio.gather(*workers, return_exceptions=True)
+                heartbeat.cancel()
+                await asyncio.gather(*workers, heartbeat, return_exceptions=True)
+
+    def _task_done(self, task) -> None:
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except (asyncio.CancelledError, RuntimeError):
+            return
+        with self._lock:
+            expected_stop = self._closed
+        if expected_stop:
+            return
+        error_type = type(error).__name__ if error is not None else "UnexpectedStop"
+        self._startup_error = error_type
+        logger.error("上传内部任务异常退出 error=%s", error_type)
+        if self._health is not None:
+            self._health.fatal("uploader_task_{}".format(error_type))
+        if self._stop is not None:
+            self._stop.set()
+
+    async def _heartbeat(self) -> None:
+        while True:
+            if self._health is not None:
+                self._health.beat("uploader")
+            await asyncio.sleep(2)
 
     async def _take(self) -> Optional[UploadFrame]:
         while True:
@@ -178,14 +214,22 @@ class FrameUploader:
                     continue
                 # Total deadline includes connection, upload AND response reading.
                 await asyncio.wait_for(client.upload(frame), timeout=self._config.timeout_sec)
+                if self._health is not None:
+                    self._health.recover("remote")
                 logger.info("远端已接收 camera=%s status=202 bytes=%d queue_wait=%.3fs elapsed=%.3fs",
                             frame.camera_id, len(frame.jpeg), age, self._clock() - started)
             except asyncio.TimeoutError:
+                if self._health is not None:
+                    self._health.degrade("remote", "timeout")
                 logger.warning("上传超时，不补发 camera=%s timeout=%.1fs",
                                frame.camera_id, self._config.timeout_sec)
             except UploadError as exc:
+                if self._health is not None:
+                    self._health.degrade("remote", "rejected")
                 logger.warning("上传未获确认，不补发 camera=%s reason=%s", frame.camera_id, exc)
             except Exception as exc:
+                if self._health is not None:
+                    self._health.degrade("remote", type(exc).__name__)
                 # httpx exception strings can contain endpoints; only log the type.
                 logger.warning("上传失败，不补发 camera=%s error=%s", frame.camera_id, type(exc).__name__)
             finally:
@@ -204,3 +248,8 @@ class FrameUploader:
             logger.warning("上传线程未在关闭期限内退出")
         if dropped:
             logger.info("退出时丢弃待传帧 count=%d", dropped)
+
+    def is_healthy(self) -> bool:
+        with self._lock:
+            closed = self._closed
+        return not closed and self._thread.is_alive() and self._startup_error is None

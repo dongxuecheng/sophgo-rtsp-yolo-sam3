@@ -10,6 +10,7 @@ import time
 import pytest
 
 from fire_smoke_monitor import logging_setup
+from fire_smoke_monitor.health import HealthRegistry
 from fire_smoke_monitor.logging_setup import DailyFileHandler, LogManager, RedactingFormatter
 
 
@@ -115,6 +116,57 @@ def test_disk_write_failure_is_rate_limited_without_recursive_logging(tmp_path):
         handler.handle(record())
     handler.close()
     assert errors.getvalue().count("OSError") == 1
+
+
+def test_size_rotation_and_total_capacity_are_bounded(tmp_path):
+    handler = DailyFileHandler(
+        tmp_path, max_file_bytes=64, max_total_bytes=128
+    )
+    for index in range(10):
+        handler.handle(record("{:02d}-{}".format(index, "x" * 35)))
+    handler.close()
+
+    files = list(tmp_path.glob("monitor-*.log"))
+    assert len(files) >= 2
+    assert any(len(path.name.split(".")) == 3 for path in files)
+    assert sum(path.stat().st_size for path in files) <= 128
+
+
+def test_low_disk_mode_prunes_old_logs_and_only_keeps_errors(tmp_path):
+    old = tmp_path / "monitor-2026-01-01.log"
+    old.write_bytes(b"x" * 100)
+    free = [50 * 1024 * 1024]
+    health = HealthRegistry()
+
+    class Usage:
+        @property
+        def free(self):
+            return free[0]
+
+    handler = DailyFileHandler(
+        tmp_path,
+        clock=lambda: datetime(2026, 8, 28).timestamp(),
+        max_file_bytes=1024,
+        max_total_bytes=4096,
+        min_free_bytes=100 * 1024 * 1024,
+        disk_usage=lambda path: Usage(),
+        health=health,
+    )
+    assert not old.exists()
+    assert handler.disk_low
+    assert "disk" in health.snapshot().degraded
+    handler.handle(record("dropped-info"))
+    handler.handle(record("kept-error", logging.ERROR))
+
+    free[0] = 200 * 1024 * 1024
+    handler.maintain()
+    assert not handler.disk_low
+    assert "disk" not in health.snapshot().degraded
+    handler.handle(record("kept-info"))
+    handler.close()
+    text = "".join(path.read_text() for path in tmp_path.glob("monitor-*.log"))
+    assert "dropped-info" not in text
+    assert "kept-error" in text and "kept-info" in text
 
 
 def test_redacts_rtsp_and_api_key_in_messages_and_tracebacks():

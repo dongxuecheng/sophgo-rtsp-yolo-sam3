@@ -4,12 +4,15 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=linaro
 WorkingDirectory=/data/sophgo-rtsp-yolo-sam3
 ExecStart=/bin/bash /data/sophgo-rtsp-yolo-sam3/start.sh config/config.yaml --no-console
 Restart=always
-RestartSec=5
+RestartSec=10
+WatchdogSec=60
+TimeoutStartSec=120
 UMask=0077
 TimeoutStopSec=45
 

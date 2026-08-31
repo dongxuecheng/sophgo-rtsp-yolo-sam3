@@ -195,10 +195,32 @@ def test_log_defaults_and_retention_limit(tmp_path):
     config = parse_config(data, tmp_path / "config")
     assert config.runtime.log_dir == (tmp_path / "logs").resolve()
     assert config.runtime.log_retention_days == 30
+    assert config.runtime.log_max_file_bytes == 100 * 1024 * 1024
+    assert config.runtime.log_max_total_bytes == 1024 * 1024 * 1024
+    assert config.runtime.min_free_disk_bytes == 5 * 1024 ** 3
+    assert config.health.max_consecutive_processing_failures == 10
     for days in (0, 31, -1, 1.5, True):
         data["runtime"]["log_retention_days"] = days
         with pytest.raises(ConfigError, match="log_retention_days"):
             parse_config(data, tmp_path)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("log_max_file_mb", 0), ("log_max_total_mb", 0),
+    ("min_free_disk_gb", 0), ("disk_check_interval_sec", 9),
+])
+def test_reject_invalid_storage_guard_values(tmp_path, key, value):
+    data = valid_data()
+    data["runtime"][key] = value
+    with pytest.raises(ConfigError):
+        parse_config(data, tmp_path)
+
+
+def test_reject_total_log_limit_smaller_than_one_file(tmp_path):
+    data = valid_data()
+    data["runtime"].update({"log_max_file_mb": 101, "log_max_total_mb": 100})
+    with pytest.raises(ConfigError, match="log_max_total_mb"):
+        parse_config(data, tmp_path)
 
 
 def test_key_file_is_literal_environment_takes_precedence(tmp_path, monkeypatch):

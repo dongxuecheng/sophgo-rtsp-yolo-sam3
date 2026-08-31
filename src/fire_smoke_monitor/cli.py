@@ -12,6 +12,7 @@ import yaml
 
 from .app import build_application
 from .config import ConfigError, load_config, validate_runtime_paths
+from .health import HealthRegistry, HealthSupervisor
 from .logging_setup import LogManager, RedactingFormatter
 
 
@@ -38,7 +39,7 @@ def _configure_console(level: str) -> None:
     root.setLevel(level)
 
 
-def _run_application(config) -> int:
+def _run_application(config, health: HealthRegistry) -> int:
     stop_event = threading.Event()
 
     def request_stop(signum: int, frame: object) -> None:
@@ -50,15 +51,24 @@ def _run_application(config) -> int:
     for sig in previous:
         signal.signal(sig, request_stop)
     application = None
+    supervisor = None
     exit_code = 0
     try:
-        application = build_application(config)
+        application = build_application(config, health)
+        supervisor = HealthSupervisor(
+            health,
+            stop_event,
+            status_interval_sec=config.health.status_log_interval_sec,
+        )
+        supervisor.start()
         application.run(stop_event)
     except Exception:
         logger.exception("服务异常退出")
         exit_code = 1
     finally:
         try:
+            if supervisor is not None:
+                supervisor.close()
             if application is not None:
                 application.close()
         except Exception:
@@ -89,15 +99,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.error("配置检查失败: %s", exc)
         return 2
 
+    health = HealthRegistry(config.health.max_consecutive_processing_failures)
     try:
         with LogManager(
             config.runtime.log_dir, config.runtime.log_retention_days,
             config.runtime.log_level, secrets=(config.pipeline.api_key(),),
             console=not args.no_console,
+            max_file_bytes=config.runtime.log_max_file_bytes,
+            max_total_bytes=config.runtime.log_max_total_bytes,
+            min_free_bytes=config.runtime.min_free_disk_bytes,
+            maintenance_interval_sec=config.runtime.disk_check_interval_sec,
+            health=health,
         ):
-            logger.info("日志已启用 directory=%s retention_days=%d native_capture=enabled",
-                        config.runtime.log_dir, config.runtime.log_retention_days)
-            return _run_application(config)
+            logger.info(
+                "日志已启用 directory=%s retention_days=%d max_file_mb=%d "
+                "max_total_mb=%d min_free_gb=%.1f native_capture=enabled",
+                config.runtime.log_dir,
+                config.runtime.log_retention_days,
+                config.runtime.log_max_file_bytes // (1024 * 1024),
+                config.runtime.log_max_total_bytes // (1024 * 1024),
+                config.runtime.min_free_disk_bytes / float(1024 ** 3),
+            )
+            return _run_application(config, health)
     except (OSError, ValueError) as exc:
         logger.error("日志初始化/关闭失败 error=%s", type(exc).__name__)
         return 1

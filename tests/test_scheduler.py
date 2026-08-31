@@ -3,6 +3,7 @@ import threading
 
 from fire_smoke_monitor.config import parse_config
 from fire_smoke_monitor.domain import Detection
+from fire_smoke_monitor.health import HealthRegistry
 from fire_smoke_monitor.scheduler import InferenceScheduler
 from fire_smoke_monitor.streams import FrameUnavailableError
 
@@ -57,7 +58,7 @@ class FakeUploader:
         return "queued"
 
 
-def make_scheduler(mode="yolo_trigger", interval=3):
+def make_scheduler(mode="yolo_trigger", interval=3, health=None):
     config = parse_config({
         "mode": mode,
         "pipeline": {"endpoint": "http://example.invalid/v1/frames", "machine_id": "box-1"},
@@ -70,7 +71,9 @@ def make_scheduler(mode="yolo_trigger", interval=3):
     events, clock = [], FakeClock()
     detector = FakeDetector(events) if mode == "yolo_trigger" else None
     source, encoder, uploader = FakeSource(events), FakeEncoder(events), FakeUploader(events)
-    scheduler = InferenceScheduler(config, source, encoder, uploader, detector, clock)
+    scheduler = InferenceScheduler(
+        config, source, encoder, uploader, detector, clock, health=health
+    )
     return scheduler, source, encoder, uploader, detector, clock, events
 
 
@@ -155,3 +158,21 @@ def test_stop_interrupts_iteration_before_next_camera():
     uploader.submit = submit_and_stop
     assert scheduler.run_iteration(stop) == 1
     assert len(uploader.frames) == 1
+
+
+def test_consecutive_internal_failures_become_fatal_but_offline_does_not():
+    health = HealthRegistry(max_processing_failures=2)
+    scheduler, source, encoder, _, _, clock, _ = make_scheduler(
+        "periodic", health=health
+    )
+    source.offline.add("cam1")
+    scheduler.run_iteration()
+    assert not health.fatal_event.is_set()
+    assert health.snapshot().processing_failures == 0
+
+    source.offline.clear()
+    encoder.encode = lambda image: (_ for _ in ()).throw(ValueError("bad frame"))
+    clock.now += 3
+    scheduler.run_iteration()
+    assert health.fatal_event.is_set()
+    assert health.snapshot().processing_failures == 2

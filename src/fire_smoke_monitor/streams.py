@@ -6,6 +6,7 @@ import time
 from typing import Any, Dict, Optional, Sequence
 
 from .config import CameraConfig
+from .health import HealthRegistry
 
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ class _CameraStream:
         queue_size: int,
         unavailable_timeout_sec: float,
         reconnect_cooldown_sec: float,
+        health: Optional[HealthRegistry] = None,
     ) -> None:
         self._sail = sail_module
         self._camera = camera
@@ -33,6 +35,7 @@ class _CameraStream:
         self._queue_size = queue_size
         self._unavailable_timeout_sec = unavailable_timeout_sec
         self._reconnect_cooldown_sec = reconnect_cooldown_sec
+        self._health = health
 
         self._state_lock = threading.Lock()
         self._decoder: Optional[Any] = None
@@ -123,9 +126,15 @@ class _CameraStream:
         elif recovered:
             logger.info("RTSP 帧已自动恢复 camera=%s", self._camera.camera_id)
         if not valid:
+            if self._health is not None:
+                self._health.degrade(
+                    "camera_{}".format(self._camera.camera_id), "frame_unavailable"
+                )
             if failure_cause is not None:
                 raise failure from failure_cause
             raise failure
+        if self._health is not None:
+            self._health.recover("camera_{}".format(self._camera.camera_id))
         return image
 
     def _record_unavailable_locked(self, now: float, detail: str) -> Optional[str]:
@@ -137,6 +146,19 @@ class _CameraStream:
         return detail
 
     def _supervise(self) -> None:
+        try:
+            self._supervise_loop()
+        except Exception as exc:
+            logger.exception(
+                "RTSP 监督线程异常退出 camera=%s error=%s",
+                self._camera.camera_id, type(exc).__name__,
+            )
+            if self._health is not None and not self._stop_event.is_set():
+                self._health.fatal(
+                    "rtsp_{}_{}".format(self._camera.camera_id, type(exc).__name__)
+                )
+
+    def _supervise_loop(self) -> None:
         while not self._stop_event.is_set():
             decoder = None
             channel = -1
@@ -244,6 +266,7 @@ class MultiRtspSource:
         queue_size: int,
         read_timeout_sec: int,
         reconnect_cooldown_sec: float,
+        health: Optional[HealthRegistry] = None,
     ) -> None:
         self._streams: Dict[str, _CameraStream] = {}
         try:
@@ -255,6 +278,7 @@ class MultiRtspSource:
                     queue_size,
                     float(read_timeout_sec),
                     reconnect_cooldown_sec,
+                    health,
                 )
                 self._streams[camera.camera_id] = stream
             for stream in self._streams.values():
@@ -277,3 +301,7 @@ class MultiRtspSource:
                 logger.warning("RTSP 后台线程未在期限内退出 camera=%s", camera_id)
         if hasattr(self, "_streams"):
             self._streams.clear()
+
+    def is_healthy(self) -> bool:
+        streams = tuple(getattr(self, "_streams", {}).values())
+        return bool(streams) and all(stream._thread.is_alive() for stream in streams)

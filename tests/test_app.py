@@ -31,15 +31,21 @@ def install_fakes(monkeypatch, events):
         raise AssertionError("periodic must not construct YOLO")
 
     class FakeUploader:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             events.append("uploader-init")
+
+        def is_healthy(self):
+            return True
 
         def close(self):
             events.append("uploader-close")
 
     class FakeSource:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             events.append("source-init")
+
+        def is_healthy(self):
+            return True
 
         def close(self):
             events.append("source-close")
@@ -64,7 +70,7 @@ def test_startup_failure_closes_started_uploader(monkeypatch):
     events = []
     install_fakes(monkeypatch, events)
 
-    def fail_source(*args):
+    def fail_source(*args, **kwargs):
         raise RuntimeError("source init error")
 
     monkeypatch.setattr(app, "MultiRtspSource", fail_source)
@@ -116,7 +122,7 @@ class FakeApplication:
         os.write(2, b"native-close\\n")
         if failure == "close":
             raise RuntimeError("close failure")
-def build(config):
+def build(config, health=None):
     if failure == "init":
         raise RuntimeError("init failure")
     return FakeApplication()

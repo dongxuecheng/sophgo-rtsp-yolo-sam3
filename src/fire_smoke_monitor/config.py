@@ -38,6 +38,17 @@ class RuntimeConfig:
     log_level: str
     log_dir: Path
     log_retention_days: int
+    log_max_file_bytes: int
+    log_max_total_bytes: int
+    min_free_disk_bytes: int
+    disk_check_interval_sec: int
+
+
+@dataclass(frozen=True)
+class HealthConfig:
+    max_consecutive_processing_failures: int
+    scheduler_stall_sec: float
+    status_log_interval_sec: float
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,7 @@ class AppConfig:
     pipeline: PipelineConfig
     yolo26: Optional[Yolo26Config]
     periodic_interval_sec: float
+    health: HealthConfig
 
     def interval_for(self, camera: CameraConfig) -> float:
         if camera.interval_sec is not None:
@@ -211,6 +223,17 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
     if mode not in {"yolo_trigger", "periodic"}:
         raise ConfigError("mode 仅支持 yolo_trigger 或 periodic")
     runtime_raw = _mapping(root.get("runtime", {}), "runtime")
+    log_max_file_mb = _integer(
+        runtime_raw.get("log_max_file_mb", 100), "runtime.log_max_file_mb", 1, 1024
+    )
+    log_max_total_mb = _integer(
+        runtime_raw.get("log_max_total_mb", 1024), "runtime.log_max_total_mb", 1, 16384
+    )
+    if log_max_total_mb < log_max_file_mb:
+        raise ConfigError("runtime.log_max_total_mb 不能小于 log_max_file_mb")
+    min_free_disk_gb = _positive(
+        runtime_raw.get("min_free_disk_gb", 5), "runtime.min_free_disk_gb"
+    )
     runtime = RuntimeConfig(
         dev_id=_integer(runtime_raw.get("dev_id", 0), "runtime.dev_id", 0, 255),
         decoder_queue_size=_integer(
@@ -227,12 +250,33 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
         log_retention_days=_integer(
             runtime_raw.get("log_retention_days", 30), "runtime.log_retention_days", 1, 30
         ),
+        log_max_file_bytes=log_max_file_mb * 1024 * 1024,
+        log_max_total_bytes=log_max_total_mb * 1024 * 1024,
+        min_free_disk_bytes=int(min_free_disk_gb * 1024 * 1024 * 1024),
+        disk_check_interval_sec=_integer(
+            runtime_raw.get("disk_check_interval_sec", 60),
+            "runtime.disk_check_interval_sec", 10, 3600,
+        ),
     )
     if runtime.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
         raise ConfigError("runtime.log_level 仅支持 DEBUG/INFO/WARNING/ERROR")
     if runtime.log_dir.parent == runtime.log_dir:
         raise ConfigError("runtime.log_dir 不能是文件系统根目录")
     pipeline = _pipeline_config(_mapping(_required(root, "pipeline", "root"), "pipeline"), base_dir)
+    health_raw = _mapping(root.get("health", {}), "health")
+    health = HealthConfig(
+        max_consecutive_processing_failures=_integer(
+            health_raw.get("max_consecutive_processing_failures", 10),
+            "health.max_consecutive_processing_failures", 1, 1000,
+        ),
+        scheduler_stall_sec=_positive(
+            health_raw.get("scheduler_stall_sec", 30), "health.scheduler_stall_sec"
+        ),
+        status_log_interval_sec=_positive(
+            health_raw.get("status_log_interval_sec", 300),
+            "health.status_log_interval_sec",
+        ),
+    )
 
     camera_items = _sequence(_required(root, "cameras", "root"), "cameras")
     if not 1 <= len(camera_items) <= MAX_CAMERAS:
@@ -280,11 +324,11 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
         )
         if "save_cooldown_sec" in raw:
             logger.warning("save_cooldown_sec 已停用：每次采样命中都提交上传，不保存本地图片")
-    if "output_root" in runtime_raw or "min_free_disk_gb" in runtime_raw:
-        logger.warning("output_root/min_free_disk_gb 已停用：两种模式均不保存本地图片")
+    if "output_root" in runtime_raw:
+        logger.warning("output_root 已停用：两种模式均不保存本地图片")
     periodic = _mapping(root.get("periodic", {}), "periodic")
     periodic_interval = _positive(periodic.get("interval_sec", 10), "periodic.interval_sec")
-    return AppConfig(mode, runtime, tuple(cameras), pipeline, yolo, periodic_interval)
+    return AppConfig(mode, runtime, tuple(cameras), pipeline, yolo, periodic_interval, health)
 
 
 def load_config(path: Path) -> AppConfig:

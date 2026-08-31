@@ -13,6 +13,7 @@ import pytest
 
 from fire_smoke_monitor.config import PipelineConfig
 from fire_smoke_monitor.domain import UploadFrame
+from fire_smoke_monitor.health import HealthRegistry
 from fire_smoke_monitor.uploader import FrameUploader, PipelineClient, UploadError
 
 
@@ -206,6 +207,28 @@ def test_429_is_dropped_and_a_new_frame_can_succeed(caplog):
     finally:
         uploader.close()
     assert len(calls) == 2
+
+
+def test_remote_failure_is_degraded_not_fatal_and_success_recovers():
+    calls = []
+    health = HealthRegistry()
+
+    async def handler(request):
+        calls.append(request)
+        return reply(503) if len(calls) == 1 else reply()
+
+    uploader = FrameUploader(
+        config(), ["cam1"], transport=httpx.MockTransport(handler), health=health
+    )
+    try:
+        uploader.submit(frame())
+        wait_for(lambda: "remote" in health.snapshot().degraded)
+        assert not health.fatal_event.is_set()
+        uploader.submit(frame(jpeg=b"fresh"))
+        wait_for(lambda: "remote" not in health.snapshot().degraded)
+        assert not health.fatal_event.is_set()
+    finally:
+        uploader.close()
 
 
 def test_expired_frames_are_not_sent_and_unknown_camera_rejected(caplog):
