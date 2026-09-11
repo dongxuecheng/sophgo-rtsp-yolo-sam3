@@ -32,6 +32,7 @@ def install_fakes(monkeypatch, events):
 
     class FakeUploader:
         def __init__(self, *args, **kwargs):
+            assert kwargs["periodic"].upload_interval_sec == 2.5
             events.append("uploader-init")
 
         def is_healthy(self):
@@ -42,6 +43,7 @@ def install_fakes(monkeypatch, events):
 
     class FakeSource:
         def __init__(self, *args, **kwargs):
+            assert args[3] == 1  # latest-only decoder queue reaches hardware
             events.append("source-init")
 
         def is_healthy(self):

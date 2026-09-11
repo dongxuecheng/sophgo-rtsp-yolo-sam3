@@ -110,22 +110,70 @@ def test_periodic_needs_no_models_and_ignores_disabled_model_paths(tmp_path):
     data = valid_data()
     data["mode"] = "periodic"
     data.pop("models")
-    data["periodic"] = {"interval_sec": 12}
+    data["periodic"] = {"upload_interval_sec": 2.5}
     config = parse_config(data, tmp_path)
     assert config.yolo26 is None
-    assert config.interval_for(config.cameras[0]) == 12
+    assert config.periodic.upload_interval_sec == 2.5
+    assert config.runtime.decoder_queue_size == 1
     validate_runtime_paths(config)
     data["models"] = {"yolo26": {"enabled": True, "bmodel": "/missing"}}
     assert parse_config(data, tmp_path).yolo26 is None
 
 
-@pytest.mark.parametrize("mode", ["periodic", "yolo_trigger"])
-def test_camera_interval_overrides_mode_default(tmp_path, mode):
+def test_camera_interval_overrides_yolo_default(tmp_path):
     data = valid_data()
-    data["mode"] = mode
     data["cameras"][0]["interval_sec"] = 7.5
     config = parse_config(data, tmp_path)
     assert config.interval_for(config.cameras[0]) == 7.5
+
+
+@pytest.mark.parametrize("field,value", [
+    ("upload_interval_sec", 0), ("upload_interval_sec", float("nan")),
+    ("upload_interval_sec", True), ("backoff_after_failures", 0),
+    ("backoff_after_failures", 1.5), ("recover_after_successes", 0),
+    ("backoff_max_interval_sec", 1), ("backoff_max_interval_sec", float("inf")),
+])
+def test_periodic_rejects_invalid_pacing_options(tmp_path, field, value):
+    data = valid_data()
+    data["mode"] = "periodic"
+    data["periodic"] = {field: value}
+    with pytest.raises(ConfigError):
+        parse_config(data, tmp_path)
+
+
+@pytest.mark.parametrize("workers", [1, 2, 3, 8])
+def test_periodic_concurrency_is_one_or_two(tmp_path, workers):
+    data = valid_data()
+    data["mode"] = "periodic"
+    data["pipeline"]["workers"] = workers
+    if workers <= 2:
+        assert parse_config(data, tmp_path).pipeline.workers == workers
+    else:
+        with pytest.raises(ConfigError, match="workers"):
+            parse_config(data, tmp_path)
+
+
+@pytest.mark.parametrize("legacy", ["global", "camera"])
+def test_periodic_legacy_timers_require_explicit_migration(tmp_path, legacy):
+    data = valid_data()
+    data["mode"] = "periodic"
+    if legacy == "global":
+        data["periodic"] = {"interval_sec": 90}
+    else:
+        data["cameras"][0]["interval_sec"] = 90
+    with pytest.raises(ConfigError, match="upload_interval_sec"):
+        parse_config(data, tmp_path)
+
+
+def test_periodic_forces_one_latest_decoder_frame(tmp_path, caplog):
+    data = valid_data()
+    data["mode"] = "periodic"
+    data["runtime"]["decoder_queue_size"] = 8
+    config = parse_config(data, tmp_path)
+    assert config.runtime.decoder_queue_size == 1
+    assert "最新一帧" in caplog.text
+    with pytest.raises(ValueError, match="全机轮询"):
+        config.interval_for(config.cameras[0])
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -1, 0, True])

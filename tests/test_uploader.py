@@ -11,7 +11,7 @@ import time
 import httpx
 import pytest
 
-from fire_smoke_monitor.config import PipelineConfig
+from fire_smoke_monitor.config import PeriodicConfig, PipelineConfig
 from fire_smoke_monitor.domain import UploadFrame
 from fire_smoke_monitor.health import HealthRegistry
 from fire_smoke_monitor.uploader import (
@@ -340,3 +340,219 @@ def test_real_http_upload_to_local_server(monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join(2)
+
+
+class PeriodicClock:
+    now = 100.0
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_periodic_reserves_bounded_slots_without_any_fifo(workers):
+    clock = PeriodicClock()
+    release, calls = threading.Event(), []
+
+    async def handler(request):
+        calls.append(request)
+        await wait_event(release)
+        return reply()
+
+    cameras = ["cam{}".format(i) for i in range(33)]
+    uploader = FrameUploader(
+        config(workers=workers, timeout_sec=5), cameras, clock=clock,
+        transport=httpx.MockTransport(handler), periodic=PeriodicConfig(),
+    )
+    try:
+        for index in range(workers):
+            camera = cameras[index]
+            assert uploader.try_reserve(camera) == "reserved"
+            # Reservation counts against concurrency even before a JPEG exists.
+            assert len(uploader._active) == index + 1
+            assert uploader.submit_reserved(frame(camera, created=clock())) == "dispatched"
+            wait_for(lambda: len(calls) == index + 1)
+            clock.now += 2.5
+        assert uploader.try_reserve(cameras[workers]) == "busy"
+        clock.now += 1000
+        assert uploader.try_reserve(cameras[workers]) == "busy"
+        assert not uploader._pending
+        assert len(calls) == workers
+        release.set()
+        wait_for(lambda: not uploader._active)
+        assert uploader.try_reserve(cameras[workers]) == "reserved"
+        uploader.submit_reserved(frame(cameras[workers], jpeg=b"fresh-after-recovery", created=clock()))
+        wait_for(lambda: len(calls) == workers + 1)
+        assert uploader.try_reserve(cameras[workers + 1]) == "paused"
+        assert not uploader._pending
+        assert fields_from_request(calls[-1])["image"].get_payload(decode=True) == b"fresh-after-recovery"
+    finally:
+        release.set()
+        uploader.close()
+    assert not uploader._active and not uploader._reserved and not uploader._periodic_tasks
+
+
+def test_periodic_reservation_is_required_and_released_without_upload():
+    clock = PeriodicClock()
+    uploader = FrameUploader(config(workers=1), ["cam1", "cam2"], clock=clock,
+                             periodic=PeriodicConfig())
+    try:
+        with pytest.raises(RuntimeError, match="禁止排队"):
+            uploader.submit(frame())
+        with pytest.raises(RuntimeError, match="未预留"):
+            uploader.submit_reserved(frame())
+        with pytest.raises(ValueError):
+            uploader.try_reserve("unknown")
+        assert uploader.try_reserve("cam1") == "reserved"
+        assert uploader.try_reserve("cam2") == "busy"
+        uploader.cancel_reservation("cam1")
+        assert not uploader._active and not uploader._reserved
+        assert uploader.try_reserve("cam2") == "paused"
+        clock.now += 2.5
+        assert uploader.try_reserve("cam2") == "reserved"
+        # close also clears a slot while the scheduler is still encoding.
+    finally:
+        uploader.close()
+    assert not uploader._reserved and not uploader._active
+    assert uploader.try_reserve("cam1") == "stopped"
+    assert uploader.submit_reserved(frame("cam2")) == "stopped"
+
+
+def test_periodic_http_429_503_reduce_machine_rate_and_never_replay(caplog):
+    clock, calls = PeriodicClock(), []
+
+    async def handler(request):
+        calls.append(request)
+        return reply({1: 429, 2: 503}.get(len(calls), 202))
+
+    uploader = FrameUploader(
+        config(), ["cam1", "cam2", "cam3"], clock=clock,
+        transport=httpx.MockTransport(handler), periodic=PeriodicConfig(),
+    )
+    try:
+        for camera in ("cam1", "cam2"):
+            assert uploader.try_reserve(camera) == "reserved"
+            uploader.submit_reserved(frame(camera, jpeg=camera.encode(), created=clock()))
+            wait_for(lambda: not uploader._active)
+            clock.now += 2.5
+        assert len(calls) == 2
+        assert uploader._pacer._interval == 5
+        assert uploader.try_reserve("cam3") == "paused"
+        assert not uploader._pending
+        clock.now += 2.5
+        for camera in ("cam3", "cam1", "cam2"):
+            assert uploader.try_reserve(camera) == "reserved"
+            uploader.submit_reserved(frame(camera, jpeg=b"new-image", created=clock()))
+            wait_for(lambda: not uploader._active)
+            if camera != "cam2":
+                clock.now += 5
+        assert len(calls) == 5
+        assert uploader._pacer._interval == 2.5
+        assert uploader.try_reserve("cam3") == "paused"
+        payloads = [fields_from_request(req)["image"].get_payload(decode=True) for req in calls]
+        assert payloads == [b"cam1", b"cam2", b"new-image", b"new-image", b"new-image"]
+        assert "全机降频" in caplog.text and "逐步恢复" in caplog.text
+    finally:
+        uploader.close()
+
+
+def test_periodic_overload_during_encoding_discards_handoff(caplog):
+    clock, calls = PeriodicClock(), []
+
+    async def handler(request):
+        calls.append(request)
+        return reply()
+
+    uploader = FrameUploader(
+        config(), ["cam1"], clock=clock,
+        transport=httpx.MockTransport(handler), periodic=PeriodicConfig(),
+    )
+    try:
+        assert uploader.try_reserve("cam1") == "reserved"
+        # Simulate two responses arriving while the hardware thread encodes.
+        uploader._pacer.report_result(429)
+        uploader._pacer.report_result(503)
+        uploader.submit_reserved(frame(jpeg=b"discard-me", created=clock()))
+        wait_for(lambda: not uploader._active)
+        assert not calls and not uploader._pending
+        clock.now += 5
+        assert uploader.try_reserve("cam1") == "reserved"
+        uploader.submit_reserved(frame(jpeg=b"latest", created=clock()))
+        wait_for(lambda: len(calls) == 1)
+        assert fields_from_request(calls[0])["image"].get_payload(decode=True) == b"latest"
+    finally:
+        uploader.close()
+
+
+def test_periodic_timeout_releases_slot_and_fresh_capture_can_resume(caplog):
+    clock, calls = PeriodicClock(), []
+
+    async def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            await asyncio.Event().wait()
+        return reply()
+
+    uploader = FrameUploader(
+        config(workers=1, timeout_sec=0.03), ["cam1", "cam2"], clock=clock,
+        transport=httpx.MockTransport(handler), periodic=PeriodicConfig(),
+    )
+    try:
+        assert uploader.try_reserve("cam1") == "reserved"
+        uploader.submit_reserved(frame(created=clock()))
+        wait_for(lambda: "上传超时" in caplog.text and not uploader._active)
+        assert uploader.is_healthy()
+        clock.now += 2.5
+        assert uploader.try_reserve("cam2") == "reserved"
+        uploader.submit_reserved(frame("cam2", jpeg=b"fresh", created=clock()))
+        wait_for(lambda: len(calls) == 2 and not uploader._active)
+        assert not uploader._pending
+    finally:
+        uploader.close()
+    assert "Task exception was never retrieved" not in caplog.text
+
+
+def test_periodic_shutdown_cancels_inflight_and_does_not_resend():
+    clock, calls, cancelled = PeriodicClock(), [], threading.Event()
+
+    async def handler(request):
+        calls.append(request)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    uploader = FrameUploader(
+        config(timeout_sec=10), ["cam1"], clock=clock,
+        transport=httpx.MockTransport(handler), periodic=PeriodicConfig(),
+    )
+    try:
+        assert uploader.try_reserve("cam1") == "reserved"
+        uploader.submit_reserved(frame(created=clock()))
+        wait_for(lambda: len(calls) == 1)
+    finally:
+        uploader.close()
+    assert cancelled.is_set()
+    assert len(calls) == 1 and not uploader._thread.is_alive()
+    assert not uploader._active and not uploader._periodic_tasks
+
+
+def test_periodic_stale_encoded_frame_is_dropped_without_reserving_another_slot(caplog):
+    clock, calls = PeriodicClock(), []
+
+    async def handler(request):
+        calls.append(request)
+        return reply()
+
+    uploader = FrameUploader(
+        config(max_pending_age_sec=3), ["cam1"], clock=clock,
+        transport=httpx.MockTransport(handler), periodic=PeriodicConfig(),
+    )
+    try:
+        assert uploader.try_reserve("cam1") == "reserved"
+        uploader.submit_reserved(frame(created=clock() - 4))
+        wait_for(lambda: not uploader._active)
+        assert not calls and not uploader._reserved and not uploader._pending
+        assert "过期" in caplog.text
+    finally:
+        uploader.close()

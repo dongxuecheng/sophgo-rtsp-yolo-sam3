@@ -1,9 +1,10 @@
 # BM1684X 多路 RTSP 采样与火烟确认
 
-面向 SE7-32（BM1684X）SoC，原生运行，无需 Docker，最多 16 路 RTSP。
+面向 SE7-32（BM1684X）SoC，原生运行，无需 Docker，软件配置上限为 64 路 RTSP。
+实际可稳定承载的路数取决于视频分辨率、帧率、码率和设备负载；配置上限不代表硬件吞吐保证。
 两种模式通过 YAML 的 `mode` 切换，重启后生效：
 
-- `periodic`：每路周期取帧，直接上传；不加载 YOLO，不要求模型文件。
+- `periodic`：全机统一轮询，到该路且有 HTTP 空位才抓最新帧直传；不加载 YOLO，不要求模型文件。
 - `yolo_trigger`：共享一份 YOLO26 模型，周期检测，命中指定目标才上传。
 
 两种模式都上传整张未标注 JPEG，**不在盒子保存图片**。
@@ -64,9 +65,10 @@ pipeline:
   api_key_env: ""                              # 有鉴权时填 PIPELINE_API_KEY
   workers: 2
   timeout_sec: 10
-  max_pending_age_sec: 30
+  max_pending_age_sec: 3
 
 runtime:
+  decoder_queue_size: 1
   log_dir: ../logs
   log_retention_days: 30
   log_max_file_mb: 100
@@ -81,7 +83,10 @@ health:
   status_log_interval_sec: 300
 
 periodic:
-  interval_sec: 10
+  upload_interval_sec: 2.5
+  backoff_after_failures: 2
+  backoff_max_interval_sec: 60
+  recover_after_successes: 3
 
 cameras:
   - id: camera_01
@@ -90,17 +95,30 @@ cameras:
   - id: camera_02
     name: 仓库西门
     url: "rtsp://user:password@192.168.1.102:554/stream1"
-    interval_sec: 20
 ```
 
 - `machine_id`、摄像头 `id` 只允许 1–64 位字母、数字、下划线和横线，摄像头 ID 必须唯一。
-- 每路 `interval_sec` 覆盖模式默认值；YOLO 默认值取 `models.yolo26.interval_sec`，periodic 取 `periodic.interval_sec`。
-- 间隔指本路取帧/检测/编码/入队完成后到下次采样的等待时间，不等待 HTTP；硬件忙时会延后，不追赶旧任务。
-- `runtime.dev_id` 默认 0，`decoder_queue_size` 默认 2；持续无帧超过 `read_timeout_sec`（默认 2）后，仅后台重建该路，重试间隔 `reconnect_cooldown_sec` 默认 10 秒。
+- periodic 的 `upload_interval_sec` 是**全机**轮询间隔：默认每 2.5 秒安排下一路，33 路正常一轮约 82.5 秒（另加编码、调度耗时）；不是每路每 2.5 秒上传。按配置顺序循环，离线路跳过本轮，下一轮再尝试。
+- periodic 上传名额满或全机退避时暂停采样，不提前读取/编码后续路的图片；恢复后取最新帧，不追赶错过的轮次。HTTP 最多并发 1–2 个，实际单路周期在忙碌/降频时会延长。
+- 仅 YOLO 支持每路 `interval_sec` 覆盖 `models.yolo26.interval_sec`；间隔指本路检测/编码/入队完成后的等待时间，不等待 HTTP，不追赶旧任务。
+- `runtime.dev_id` 默认 0。periodic 固定 `decoder_queue_size=1`，应用层每路只保留最新一张待采样帧；YOLO 默认 2。底层编解码器本身仍有必要的工作/参考帧缓冲。
+- RTSP 持续硬件解码，采样间隔不会自动降低摄像头传输码率/解码帧率。持续无帧超过 `read_timeout_sec`（默认 2）后，仅后台重建该路，重试间隔 `reconnect_cooldown_sec` 默认 10 秒。
 - `periodic` 忽略整个 `models`。YOLO 命中多个框也只上传一张原图，本地漏检会挡住后续复核。
 - 原图不缩放；默认最大 8 MiB、1600 万像素。超限时跳过并记日志，可降低摄像头子码流分辨率。调整 `max_image_bytes/max_image_pixels` 须同步远端限制。
 - 相对模型/日志路径以 YAML 所在目录为基准。旧配置不添加新增字段时使用安全默认值：30 天、单文件 100 MiB、日志总量 1 GiB、日志所在文件系统至少保留 5 GiB。
 - 旧 `output_root/save_cooldown_sec` 已停用；不会转换成上传冷却。`min_free_disk_gb` 现在用于日志磁盘保护，两种模式仍不写检测图片。
+
+### 从旧 periodic 配置升级
+
+请修改设备上实际使用的 `config/config.yaml`（或服务指定的其他 YAML），保留接口、摄像头和鉴权信息：
+
+1. 删除 `periodic.interval_sec: 90` 等旧字段，换成上面的 `periodic.upload_interval_sec: 2.5` 和退避配置。
+2. 删除所有摄像头下的 `interval_sec`；新模式没有每路独立定时器。
+3. `pipeline.workers` 只能为 1 或 2；`runtime.decoder_queue_size` 设为 1（旧值会自动覆盖为 1 并告警）。
+4. `max_pending_age_sec` 可保留 3 秒，用于发送前的编码/交接年龄保护，不再意味着让 33 张图片排队等 3 秒。
+5. 先执行 `bash start.sh config/config.yaml --check-config`，通过后再 `sudo systemctl restart fire-smoke-monitor`。
+
+含旧 periodic 定时字段会明确报配置错误，防止把旧的“每路 90 秒”静默解释为新的“全机每 90 秒一路”。代码更新不会覆盖现场私有配置，不新增依赖。
 
 ### 密钥
 
@@ -155,10 +173,19 @@ tail -F "logs/monitor-$(date +%F).log"
 YOLO/BMCV 处理在一个硬件线程串行执行；压缩 JPEG 才进入独立 HTTP 线程，不跨线程共享 BMImage。
 JPEG 通过 `Bmcv.imencode` 调用 Sophon OpenCV，JPU 是否实际启用需在盒子验证。
 
-每路最多一张正在上传和一张最新待传图，新图替换同路待传旧图，保持队列位置。
-HTTP 并发默认 2（可设 1–8）；`timeout_sec` 是覆盖连接、等待连接池、发送图片及读取响应的单一总截止时间，超时 Task 会被取消并完整回收。所有上传名额占满时其他路需排队，但不阻塞取帧/推理。
+periodic 不使用待传 JPEG FIFO：先按全机节奏预留 HTTP 名额，再非阻塞读取该路唯一最新帧、编码、直接交给 HTTP 循环；包含取帧/编码/交接在内的名额总数也不超过 `workers`，每路最多一个在途请求。非轮到的路只在解码器中覆盖最新帧。
+YOLO 保留原有有界队列：每路最多一张正在上传和一张最新待传图，新图替换旧图，保持队列位置；名额满时只排队压缩 JPEG，不阻塞检测。
+HTTP 并发默认 2（periodic 只允许 1–2，YOLO 可设 1–8）；`timeout_sec` 覆盖连接、等待连接池、发送图片及读取响应，超时 Task 会被取消并完整回收。
 超时日志中的 `scope=total` 表示达到总截止时间；`scope=httpx` 表示传输层主动报告了具体的 `ConnectTimeout/WriteTimeout/ReadTimeout/PoolTimeout`。
 超时、429、503 等不补发旧图；下一次采样继续，网络恢复后自动恢复。待传图过期或程序退出时丢弃，没有磁盘补发队列。
+
+periodic 自动降频以本机所有上传的**完成结果顺序**计数，429 和 503 合并统计：
+
+- 默认每连续两次 429/503 将全机上传间隔翻倍：`2.5 → 5 → 10 → 20 → 40 → 60` 秒，上限由 `backoff_max_interval_sec` 指定。达到上限后持续拒绝仍会暂停下一次采样。
+- 退避期间不抓图，不排队旧图；已发出的最多两个请求正常完成。若编码期间其他请求触发退避，交接时丢弃当前图，不延后补发。
+- 默认连续三次合法的 `202 + accepted=true` 才将间隔减半，逐步恢复至基础间隔；不提前已经安排好的下一次时刻，不补偿过去欠下的请求。
+- 非 429/503 结果会打断连续过载计数；超时、其他 HTTP 错误会打断连续成功计数，不会触发这里的过载倍增策略。
+- 日志 `periodic 全机降频` / `periodic 上传频率逐步恢复` 显示当前全机间隔。如频繁降频，应进一步检查服务端处理能力；节流不能保证每张受理图都完成远端检测。
 
 ### 健康检查与自动恢复边界
 
@@ -205,7 +232,7 @@ systemctl show fire-smoke-monitor -p ActiveState -p SubState -p StatusText -p NR
 - 缺 `sophon.sail` / `cv2`：检查完整 SAIL 以及 SDK OpenCV，禁止普通 pip OpenCV 覆盖。
 - `already running`：先停止已有脚本/systemd 实例；锁会随进程退出释放，不要删除锁文件绕过保护。
 - `401`：核对密钥；`400/422`：核对图片/ID/参数；`413`：图片过大。
-- 频繁 `429/503`、超时、待传替换：检查远端负载/网络，必要时增大采样间隔。
+- 频繁 `429/503`：periodic 自动降低全机频率；仍应检查远端负载/网络，必要时增大 `periodic.upload_interval_sec`。YOLO 待传替换频繁时增大检测间隔。
 - 有 202 无证据：查远端模型日志；`GET /health` 只检查流水线服务及累计计数，不验证模型效果。
 - 观察盒子：`free -h`、`vmstat 1`、`bm-smi`、`cat /proc/vpuinfo`、`cat /proc/jpuinfo`、`df -h /data`。
 

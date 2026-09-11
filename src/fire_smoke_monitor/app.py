@@ -54,6 +54,7 @@ class MonitorApplication:
             self._uploader = FrameUploader(
                 config.pipeline, [camera.camera_id for camera in config.cameras],
                 health=self._health,
+                periodic=config.periodic if config.mode == "periodic" else None,
             )
             self._health.beat("uploader")
             self._health.require_heartbeat(

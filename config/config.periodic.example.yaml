@@ -1,19 +1,19 @@
-# 不进行本地 YOLO 推理；每路采样一张原图上传给远端 SAM3 + LLM 服务。
+# 不进行本地 YOLO 推理；全机统一轮询，到该路且有 HTTP 空位才抓最新帧。
 mode: periodic
 
 pipeline:
   endpoint: http://192.168.1.200:18080/v1/frames
   machine_id: se7-01
   api_key_env: ""
-  workers: 2
+  workers: 2  # periodic 只允许 1 或 2；名额占满时不提前取帧
   timeout_sec: 10
-  max_pending_age_sec: 30
+  max_pending_age_sec: 3  # 仅防编码/跨线程交接意外耗时；没有待上传 FIFO
   max_image_bytes: 8388608
   max_image_pixels: 16000000
 
 runtime:
   dev_id: 0
-  decoder_queue_size: 2
+  decoder_queue_size: 1  # periodic 固定为 1，新帧覆盖旧帧
   read_timeout_sec: 2
   reconnect_cooldown_sec: 10
   log_level: INFO
@@ -30,7 +30,13 @@ health:
   status_log_interval_sec: 300
 
 periodic:
-  interval_sec: 10
+  # 全机每 2.5 秒选择下一路；33 路正常一轮约 82.5 秒，不追赶积欠轮次。
+  upload_interval_sec: 2.5
+  # 连续两次 429/503 后间隔翻倍，每再连续两次继续翻倍，上限 60 秒。
+  backoff_after_failures: 2
+  backoff_max_interval_sec: 60
+  # 连续三次 202 accepted=true 后间隔减半，逐步恢复至 2.5 秒。
+  recover_after_successes: 3
 
 cameras:
   - id: camera_01
@@ -39,4 +45,4 @@ cameras:
   # - id: camera_02
   #   name: 仓库西门
   #   url: rtsp://user:password@192.168.1.102:554/stream1
-  #   interval_sec: 20
+  # periodic 不设置每路 interval_sec。

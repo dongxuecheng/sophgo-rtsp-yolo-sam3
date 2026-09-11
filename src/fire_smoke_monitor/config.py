@@ -18,7 +18,8 @@ class ConfigError(ValueError):
 
 logger = logging.getLogger(__name__)
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-MAX_CAMERAS = 16
+# Software configuration limit; actual throughput depends on the stream profiles.
+MAX_CAMERAS = 64
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,14 @@ class HealthConfig:
     max_consecutive_processing_failures: int
     scheduler_stall_sec: float
     status_log_interval_sec: float
+
+
+@dataclass(frozen=True)
+class PeriodicConfig:
+    upload_interval_sec: float = 2.5
+    backoff_after_failures: int = 2
+    backoff_max_interval_sec: float = 60.0
+    recover_after_successes: int = 3
 
 
 @dataclass(frozen=True)
@@ -92,15 +101,15 @@ class AppConfig:
     cameras: Sequence[CameraConfig]
     pipeline: PipelineConfig
     yolo26: Optional[Yolo26Config]
-    periodic_interval_sec: float
+    periodic: PeriodicConfig
     health: HealthConfig
 
     def interval_for(self, camera: CameraConfig) -> float:
+        if self.yolo26 is None:
+            raise ValueError("periodic 使用全机轮询间隔，不使用每路定时器")
         if camera.interval_sec is not None:
             return camera.interval_sec
-        if self.yolo26 is not None:
-            return self.yolo26.interval_sec
-        return self.periodic_interval_sec
+        return self.yolo26.interval_sec
 
 
 def _mapping(value: Any, name: str) -> Mapping[str, Any]:
@@ -234,11 +243,16 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
     min_free_disk_gb = _positive(
         runtime_raw.get("min_free_disk_gb", 5), "runtime.min_free_disk_gb"
     )
+    decoder_queue_size = _integer(
+        runtime_raw.get("decoder_queue_size", 1 if mode == "periodic" else 2),
+        "runtime.decoder_queue_size", 1, 8,
+    )
+    if mode == "periodic" and decoder_queue_size != 1:
+        logger.warning("periodic 模式固定只缓存每路最新一帧，decoder_queue_size 已设为 1")
+        decoder_queue_size = 1
     runtime = RuntimeConfig(
         dev_id=_integer(runtime_raw.get("dev_id", 0), "runtime.dev_id", 0, 255),
-        decoder_queue_size=_integer(
-            runtime_raw.get("decoder_queue_size", 2), "runtime.decoder_queue_size", 1, 8
-        ),
+        decoder_queue_size=decoder_queue_size,
         read_timeout_sec=_integer(
             runtime_raw.get("read_timeout_sec", 2), "runtime.read_timeout_sec", 1, 3600
         ),
@@ -263,6 +277,8 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
     if runtime.log_dir.parent == runtime.log_dir:
         raise ConfigError("runtime.log_dir 不能是文件系统根目录")
     pipeline = _pipeline_config(_mapping(_required(root, "pipeline", "root"), "pipeline"), base_dir)
+    if mode == "periodic" and pipeline.workers > 2:
+        raise ConfigError("periodic 模式 pipeline.workers 只能为 1 或 2")
     health_raw = _mapping(root.get("health", {}), "health")
     health = HealthConfig(
         max_consecutive_processing_failures=_integer(
@@ -297,6 +313,8 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
             raise ConfigError("{}.name 最长为 256 字符".format(prefix))
         interval = raw.get("interval_sec")
         if interval is not None:
+            if mode == "periodic":
+                raise ConfigError("periodic 不再支持每路 interval_sec，请删除并设置 periodic.upload_interval_sec")
             interval = _positive(interval, "{}.interval_sec".format(prefix))
         seen_ids.add(camera_id)
         cameras.append(CameraConfig(camera_id, url, name, interval))
@@ -326,9 +344,28 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
             logger.warning("save_cooldown_sec 已停用：每次采样命中都提交上传，不保存本地图片")
     if "output_root" in runtime_raw:
         logger.warning("output_root 已停用：两种模式均不保存本地图片")
-    periodic = _mapping(root.get("periodic", {}), "periodic")
-    periodic_interval = _positive(periodic.get("interval_sec", 10), "periodic.interval_sec")
-    return AppConfig(mode, runtime, tuple(cameras), pipeline, yolo, periodic_interval, health)
+    periodic = PeriodicConfig()
+    if mode == "periodic":
+        raw = _mapping(root.get("periodic", {}), "periodic")
+        if "interval_sec" in raw:
+            raise ConfigError("periodic.interval_sec 已停用，请删除并设置全机 periodic.upload_interval_sec（例如 2.5）")
+        periodic = PeriodicConfig(
+            upload_interval_sec=_positive(
+                raw.get("upload_interval_sec", 2.5), "periodic.upload_interval_sec"
+            ),
+            backoff_after_failures=_integer(
+                raw.get("backoff_after_failures", 2), "periodic.backoff_after_failures", 1, 100,
+            ),
+            backoff_max_interval_sec=_positive(
+                raw.get("backoff_max_interval_sec", 60), "periodic.backoff_max_interval_sec",
+            ),
+            recover_after_successes=_integer(
+                raw.get("recover_after_successes", 3), "periodic.recover_after_successes", 1, 100,
+            ),
+        )
+        if periodic.backoff_max_interval_sec < periodic.upload_interval_sec:
+            raise ConfigError("periodic.backoff_max_interval_sec 不能小于 upload_interval_sec")
+    return AppConfig(mode, runtime, tuple(cameras), pipeline, yolo, periodic, health)
 
 
 def load_config(path: Path) -> AppConfig:

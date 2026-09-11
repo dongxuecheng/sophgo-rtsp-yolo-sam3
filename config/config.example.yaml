@@ -1,4 +1,4 @@
-# yolo_trigger：命中目标后上传；periodic：不加载 YOLO，按周期直接上传。
+# yolo_trigger：命中目标后上传；periodic：不加载 YOLO，全机错峰轮询上传。
 # 切换后重启程序；两种模式都不在盒子保存图片。
 mode: yolo_trigger
 
@@ -9,9 +9,10 @@ pipeline:
   machine_id: se7-01
   # 服务端未配置密钥时留空；否则填 PIPELINE_API_KEY，并在环境中设置同名变量。
   api_key_env: ""
-  workers: 2
+  workers: 2  # periodic 只允许 1 或 2；YOLO 允许 1-8
   timeout_sec: 10
-  # 每路最多一个正在上传帧 + 一个最新待传帧；过期帧丢弃，不补发。
+  # YOLO 每路一个最新待传帧；periodic 没有待传 FIFO，取帧前先预留 HTTP 名额。
+  # 两种模式发送前均检查图片年龄；过期丢弃，不补发。
   max_pending_age_sec: 30
   # 应与远端 MAX_IMAGE_BYTES / MAX_IMAGE_PIXELS 一致。
   max_image_bytes: 8388608
@@ -19,7 +20,7 @@ pipeline:
 
 runtime:
   dev_id: 0
-  decoder_queue_size: 2
+  decoder_queue_size: 2  # periodic 自动固定为 1
   # 调度器始终非阻塞；单路持续无有效帧达到该时间后，在后台重建该路解码器。
   read_timeout_sec: 2
   # 单路解码器重建尝试间隔，同时也是无帧告警冷却时间。
@@ -47,14 +48,17 @@ cameras:
   - id: camera_01
     name: 仓库东门
     url: rtsp://user:password@192.168.1.101:554/stream1
-    # 可选：覆盖当前模式的默认采样间隔（秒）。
+    # 仅 YOLO 可选：覆盖默认采样间隔（秒）。periodic 必须删除此字段。
     # interval_sec: 15
-  # 最多 16 路；按需继续添加唯一 id 和对应 RTSP 地址。
+  # 软件配置上限 64 路；按需添加唯一 id，实际承载路数取决于视频规格和设备负载。
   # - id: camera_02
   #   url: rtsp://user:password@192.168.1.102:554/stream1
 
 periodic:
-  interval_sec: 10
+  upload_interval_sec: 2.5
+  backoff_after_failures: 2
+  backoff_max_interval_sec: 60
+  recover_after_successes: 3
 
 # periodic 模式忽略此节，也可以完全删除；不需要 BModel 和类别文件。
 models:

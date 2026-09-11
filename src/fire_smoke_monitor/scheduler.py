@@ -41,25 +41,36 @@ class InferenceScheduler:
         self._detector = detector
         self._clock = clock
         self._health = health
+        self._cameras = config.cameras
+        self._cursor = 0
+        self._periodic_interval = config.periodic.upload_interval_sec
         now = clock()
-        self._jobs = [_Job(camera, config.interval_for(camera), now) for camera in config.cameras]
+        self._jobs = [] if config.mode == "periodic" else [
+            _Job(camera, config.interval_for(camera), now) for camera in config.cameras
+        ]
         if self._health is not None:
             self._health.beat("scheduler")
             self._health.require_heartbeat("scheduler", config.health.scheduler_stall_sec)
 
     def run(self, stop_event: threading.Event) -> None:
         logger.info("取帧调度已启动 mode=%s cameras=%d local_save=disabled",
-                    self._mode, len(self._jobs))
+                    self._mode, len(self._cameras))
+        if self._mode == "periodic":
+            logger.info("统一轮询已启用 upload_interval=%.3fs latest_only=true pending_fifo=disabled",
+                        self._periodic_interval)
         while not stop_event.is_set() and not self._fatal():
             self._beat()
             if self.run_iteration(stop_event):
                 continue
-            delay = min(job.next_due for job in self._jobs) - self._clock()
+            delay = (0.1 if self._mode == "periodic" else
+                     min(job.next_due for job in self._jobs) - self._clock())
             stop_event.wait(max(0.01, min(0.5, delay)))
 
     def run_iteration(self, stop_event: Optional[threading.Event] = None) -> int:
         now = self._clock()
         self._beat()
+        if self._mode == "periodic":
+            return self._run_periodic(stop_event)
         due = sorted((job for job in self._jobs if job.next_due <= now),
                      key=lambda job: job.next_due)
         count = 0
@@ -72,7 +83,35 @@ class InferenceScheduler:
         return count
 
     def _run_job(self, job: _Job) -> None:
-        camera = job.camera
+        try:
+            self._process_camera(job.camera, self._uploader.submit)
+        finally:
+            # YOLO retains per-camera fixed delays, with no replay/catch-up.
+            job.next_due = self._clock() + job.interval_sec
+
+    def _run_periodic(self, stop_event: Optional[threading.Event]) -> int:
+        if (stop_event is not None and stop_event.is_set()) or self._fatal():
+            return 0
+        camera = self._cameras[self._cursor]
+        state = self._uploader.try_reserve(camera.camera_id)
+        if state == "stopped":
+            raise RuntimeError("periodic 上传器已停止")
+        if state != "reserved":
+            # Busy or globally rate-limited: no image is sampled or encoded.
+            return 0
+        try:
+            if (stop_event is not None and stop_event.is_set()) or self._fatal():
+                return 0
+            # An offline camera consumes this turn, not the whole scheduler.
+            self._cursor = (self._cursor + 1) % len(self._cameras)
+            self._process_camera(camera, self._uploader.submit_reserved)
+            return 1
+        finally:
+            # No-op after handoff; releases the slot on read/encode failure.
+            self._uploader.cancel_reservation(camera.camera_id)
+            self._beat()
+
+    def _process_camera(self, camera: CameraConfig, submit: Callable[[UploadFrame], str]) -> None:
         started = self._clock()
         try:
             image = self._source.read(camera.camera_id)
@@ -90,7 +129,7 @@ class InferenceScheduler:
                         self._health.processing_success()
                     return
             jpeg = self._encoder.encode(image)
-            state = self._uploader.submit(UploadFrame(
+            state = submit(UploadFrame(
                 camera.camera_id, camera.name, captured_at, frame_time, jpeg,
             ))
             if state == "stopped":
@@ -118,10 +157,6 @@ class InferenceScheduler:
                     "连续内部处理失败 count=%d limit=%d",
                     count, self._health.processing_failure_limit,
                 )
-        finally:
-            # Fixed delay: no replay/catch-up even if hardware work was slow.
-            job.next_due = self._clock() + job.interval_sec
-
     def _beat(self) -> None:
         if self._health is not None:
             self._health.beat("scheduler")

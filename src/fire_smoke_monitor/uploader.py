@@ -10,9 +10,10 @@ from typing import Callable, Optional, Sequence, Set
 
 import httpx
 
-from .config import PipelineConfig
+from .config import PeriodicConfig, PipelineConfig
 from .domain import UploadFrame
 from .health import HealthRegistry
+from .pacing import PeriodicPacer
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 class UploadError(RuntimeError):
     """A safe error message without URLs, credentials or remote response text."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _consume_task_exception(task: asyncio.Task) -> None:
@@ -67,7 +72,7 @@ class PipelineClient:
             headers=self._headers,
         ) as response:
             if response.status_code != 202:
-                raise UploadError("HTTP {}".format(response.status_code))
+                raise UploadError("HTTP {}".format(response.status_code), response.status_code)
             # The API response is tiny. Never retain an unbounded response body.
             body = bytearray()
             async for chunk in response.aiter_raw():
@@ -83,11 +88,11 @@ class PipelineClient:
 
 
 class FrameUploader:
-    """Bounded, latest-per-camera queue on an independent HTTP event loop.
+    """An independent HTTP loop with two distinct admission policies.
 
-    At most one request per camera is in flight. Replacing a queued frame keeps
-    its FIFO position so a busy camera cannot starve another camera. Failed or
-    timed-out requests are never retried: the server has no idempotency key.
+    YOLO uses a bounded latest-per-camera queue. Periodic reserves an HTTP slot
+    BEFORE capture and dispatches directly, with no pending-image FIFO.
+    Neither path retries failed/timed-out requests (no server idempotency key).
     """
 
     def __init__(
@@ -95,7 +100,10 @@ class FrameUploader:
         clock: Callable[[], float] = time.monotonic,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         health: Optional[HealthRegistry] = None,
+        periodic: Optional[PeriodicConfig] = None,
     ):
+        if periodic is not None and config.workers not in (1, 2):
+            raise ValueError("periodic HTTP 并发只能为 1 或 2")
         self._config = config
         self._camera_ids = frozenset(camera_ids)
         self._clock = clock
@@ -105,6 +113,10 @@ class FrameUploader:
         self._lock = threading.Lock()
         self._pending: OrderedDict[str, UploadFrame] = OrderedDict()
         self._active: Set[str] = set()
+        self._reserved: Set[str] = set()
+        self._pacer = PeriodicPacer(periodic, clock) if periodic is not None else None
+        self._periodic_tasks: Set[asyncio.Task] = set()
+        self._client = None
         self._closed = False
         self._ready = threading.Event()
         self._loop = None
@@ -121,10 +133,9 @@ class FrameUploader:
             raise RuntimeError("上传线程启动失败: {}".format(self._startup_error))
 
     def submit(self, frame: UploadFrame) -> str:
-        if frame.camera_id not in self._camera_ids:
-            raise ValueError("未配置的摄像头")
-        if not frame.jpeg or len(frame.jpeg) > self._config.max_image_bytes:
-            raise ValueError("JPEG 为空或超过上传限制")
+        if self._pacer is not None:
+            raise RuntimeError("periodic 必须先预留上传名额，禁止排队图片")
+        self._validate_frame(frame)
         with self._lock:
             if self._closed:
                 return "stopped"
@@ -132,6 +143,75 @@ class FrameUploader:
             self._pending[frame.camera_id] = frame
         self._notify(self._wake)
         return "replaced" if replaced else "queued"
+
+    def _validate_frame(self, frame: UploadFrame) -> None:
+        if frame.camera_id not in self._camera_ids:
+            raise ValueError("未配置的摄像头")
+        if not frame.jpeg or len(frame.jpeg) > self._config.max_image_bytes:
+            raise ValueError("JPEG 为空或超过上传限制")
+
+    def try_reserve(self, camera_id: str) -> str:
+        """Called by the sole periodic scheduler before touching any frame."""
+        if self._pacer is None or camera_id not in self._camera_ids:
+            raise ValueError("未配置的 periodic 摄像头")
+        with self._lock:
+            if self._closed:
+                return "stopped"
+            if len(self._active) >= self._config.workers or camera_id in self._active:
+                return "busy"
+            if not self._pacer.try_acquire():
+                return "paused"
+            self._active.add(camera_id)
+            self._reserved.add(camera_id)
+            return "reserved"
+
+    def cancel_reservation(self, camera_id: str) -> None:
+        with self._lock:
+            if camera_id in self._reserved:
+                self._reserved.remove(camera_id)
+                self._active.discard(camera_id)
+
+    def submit_reserved(self, frame: UploadFrame) -> str:
+        self._validate_frame(frame)
+        with self._lock:
+            if self._closed:
+                return "stopped"
+            if frame.camera_id not in self._reserved:
+                raise RuntimeError("上传前未预留名额")
+            self._reserved.remove(frame.camera_id)
+        try:
+            self._loop.call_soon_threadsafe(self._dispatch_reserved, frame)
+        except RuntimeError:
+            with self._lock:
+                self._active.discard(frame.camera_id)
+            return "stopped"
+        return "dispatched"
+
+    def _dispatch_reserved(self, frame: UploadFrame) -> None:
+        # Runs on the HTTP loop. This handoff already owns a slot; it never
+        # waits behind another request or enters the YOLO pending queue.
+        with self._lock:
+            if self._closed:
+                self._active.discard(frame.camera_id)
+                return
+        task = asyncio.create_task(self._upload_reserved(frame))
+        self._periodic_tasks.add(task)
+        task.add_done_callback(self._periodic_done)
+
+    def _periodic_done(self, task) -> None:
+        self._periodic_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            self._task_done(task)
+
+    async def _upload_reserved(self, frame: UploadFrame) -> None:
+        try:
+            if not self._pacer.start_upload():
+                logger.info("全机节流，丢弃当前帧，不补发 camera=%s", frame.camera_id)
+                return
+            await self._upload_frame(self._client, frame)
+        finally:
+            with self._lock:
+                self._active.discard(frame.camera_id)
 
     def _notify(self, event) -> None:
         loop = self._loop
@@ -156,6 +236,8 @@ class FrameUploader:
             with self._lock:
                 self._closed = True
                 self._pending.clear()
+                self._reserved.clear()
+                self._active.clear()
             self._ready.set()
 
     async def _serve(self) -> None:
@@ -173,8 +255,10 @@ class FrameUploader:
             transport=self._transport,
         ) as http:
             client = PipelineClient(self._config, http, self._api_key)
-            workers = [asyncio.create_task(self._worker(client))
-                       for _ in range(self._config.workers)]
+            self._client = client
+            workers = [] if self._pacer is not None else [
+                asyncio.create_task(self._worker(client)) for _ in range(self._config.workers)
+            ]
             heartbeat = asyncio.create_task(self._heartbeat())
             for task in workers + [heartbeat]:
                 task.add_done_callback(self._task_done)
@@ -185,10 +269,12 @@ class FrameUploader:
             try:
                 await self._stop.wait()
             finally:
-                for worker in workers:
-                    worker.cancel()
-                heartbeat.cancel()
-                await asyncio.gather(*workers, heartbeat, return_exceptions=True)
+                with self._lock:
+                    self._closed = True
+                tasks = workers + [heartbeat] + list(self._periodic_tasks)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     def _task_done(self, task) -> None:
         if task.cancelled():
@@ -232,47 +318,51 @@ class FrameUploader:
             frame = await self._take()
             if frame is None:
                 return
-            started = self._clock()
             try:
-                age = started - frame.created_monotonic
-                if age > self._config.max_pending_age_sec:
-                    logger.warning("丢弃过期待传帧 camera=%s age=%.1fs", frame.camera_id, age)
-                    continue
-                # Total deadline includes connection, upload AND response reading.
-                await _await_upload(
-                    client.upload(frame), timeout_sec=self._config.timeout_sec
-                )
-                if self._health is not None:
-                    self._health.recover("remote")
-                logger.info("远端已接收 camera=%s status=202 bytes=%d queue_wait=%.3fs elapsed=%.3fs",
-                            frame.camera_id, len(frame.jpeg), age, self._clock() - started)
-            except asyncio.TimeoutError:
-                if self._health is not None:
-                    self._health.degrade("remote", "timeout")
-                logger.warning(
-                    "上传超时，不补发 camera=%s scope=total timeout=%.1fs",
-                    frame.camera_id, self._config.timeout_sec,
-                )
-            except httpx.TimeoutException as exc:
-                if self._health is not None:
-                    self._health.degrade("remote", "timeout")
-                logger.warning(
-                    "上传超时，不补发 camera=%s scope=httpx error=%s",
-                    frame.camera_id, type(exc).__name__,
-                )
-            except UploadError as exc:
-                if self._health is not None:
-                    self._health.degrade("remote", "rejected")
-                logger.warning("上传未获确认，不补发 camera=%s reason=%s", frame.camera_id, exc)
-            except Exception as exc:
-                if self._health is not None:
-                    self._health.degrade("remote", type(exc).__name__)
-                # httpx exception strings can contain endpoints; only log the type.
-                logger.warning("上传失败，不补发 camera=%s error=%s", frame.camera_id, type(exc).__name__)
+                await self._upload_frame(client, frame)
             finally:
                 with self._lock:
                     self._active.discard(frame.camera_id)
                 self._wake.set()
+
+    async def _upload_frame(self, client: PipelineClient, frame: UploadFrame) -> None:
+        started = self._clock()
+        age = started - frame.created_monotonic
+        if age > self._config.max_pending_age_sec:
+            logger.warning("丢弃过期待传帧 camera=%s age=%.1fs", frame.camera_id, age)
+            return
+        status_code = None
+        try:
+            # Total deadline includes connection, upload AND response reading.
+            await _await_upload(client.upload(frame), timeout_sec=self._config.timeout_sec)
+            status_code = 202
+            if self._health is not None:
+                self._health.recover("remote")
+            logger.info("远端已接收 camera=%s status=202 bytes=%d queue_wait=%.3fs elapsed=%.3fs",
+                        frame.camera_id, len(frame.jpeg), age, self._clock() - started)
+        except asyncio.TimeoutError:
+            if self._health is not None:
+                self._health.degrade("remote", "timeout")
+            logger.warning("上传超时，不补发 camera=%s scope=total timeout=%.1fs",
+                           frame.camera_id, self._config.timeout_sec)
+        except httpx.TimeoutException as exc:
+            if self._health is not None:
+                self._health.degrade("remote", "timeout")
+            logger.warning("上传超时，不补发 camera=%s scope=httpx error=%s",
+                           frame.camera_id, type(exc).__name__)
+        except UploadError as exc:
+            status_code = exc.status_code
+            if self._health is not None:
+                self._health.degrade("remote", "rejected")
+            logger.warning("上传未获确认，不补发 camera=%s reason=%s", frame.camera_id, exc)
+        except Exception as exc:
+            if self._health is not None:
+                self._health.degrade("remote", type(exc).__name__)
+            # httpx exception strings can contain endpoints; only log the type.
+            logger.warning("上传失败，不补发 camera=%s error=%s", frame.camera_id, type(exc).__name__)
+        finally:
+            if self._pacer is not None:
+                self._pacer.report_result(status_code)
 
     def close(self) -> None:
         with self._lock:
