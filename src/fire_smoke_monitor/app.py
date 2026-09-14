@@ -7,6 +7,7 @@ from typing import Optional
 from .config import AppConfig
 from .encoding import JpegEncoder
 from .health import HealthFailure, HealthRegistry
+from .metrics import CameraMetrics
 from .scheduler import InferenceScheduler
 from .streams import MultiRtspSource
 from .uploader import FrameUploader
@@ -51,10 +52,17 @@ class MonitorApplication:
             else:
                 logger.info("定时直传模式：不加载 YOLO，不进行本地目标检测")
 
+            metrics = None
+            if config.yolo26 is not None:
+                metrics = CameraMetrics([camera.camera_id for camera in config.cameras],
+                                        config.health, self._health)
+                self._health.register_probe("camera_coverage", metrics.inspect)
+
             self._uploader = FrameUploader(
                 config.pipeline, [camera.camera_id for camera in config.cameras],
                 health=self._health,
                 periodic=config.periodic if config.mode == "periodic" else None,
+                metrics=metrics,
             )
             self._health.beat("uploader")
             self._health.require_heartbeat(
@@ -75,6 +83,7 @@ class MonitorApplication:
             self._scheduler = InferenceScheduler(
                 config, self._source, encoder, self._uploader, self._detector,
                 health=self._health,
+                metrics=metrics,
             )
         except Exception:
             self.close()

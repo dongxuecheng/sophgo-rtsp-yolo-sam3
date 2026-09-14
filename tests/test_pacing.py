@@ -1,7 +1,7 @@
 import pytest
 
-from fire_smoke_monitor.config import PeriodicConfig
-from fire_smoke_monitor.pacing import PeriodicPacer
+from fire_smoke_monitor.config import PeriodicConfig, UploadBackoffConfig
+from fire_smoke_monitor.pacing import PeriodicPacer, YoloUploadPacer
 
 
 class Clock:
@@ -94,3 +94,40 @@ def test_other_failures_break_success_recovery_streak():
     pacer.report_result(None)
     pacer.report_result(202)
     assert pacer._interval == 5
+
+
+def test_yolo_normal_upload_has_no_artificial_wait_and_overload_is_bounded():
+    clock = Clock()
+    pacer = YoloUploadPacer(UploadBackoffConfig(), clock)
+    for _ in range(33):
+        assert pacer.delay() == 0
+        assert pacer.start_upload()
+    for interval in (2.5, 5, 10, 20, 40, 60, 60):
+        pacer.report_result(429)
+        pacer.report_result(503)
+        assert pacer._interval == interval
+        assert pacer.delay() == interval
+        assert not pacer.start_upload()
+        clock.now += interval
+        assert pacer.start_upload()
+        assert not pacer.start_upload()
+
+
+def test_yolo_success_recovery_returns_to_immediate_without_catchup():
+    clock = Clock()
+    pacer = YoloUploadPacer(UploadBackoffConfig(), clock)
+    for _ in range(4):
+        pacer.report_result(503)
+    assert pacer._interval == 5
+    deadline = pacer._next_allowed
+    for _ in range(3):
+        pacer.report_result(202)
+    assert pacer._interval == 2.5
+    for _ in range(3):
+        pacer.report_result(202)
+    assert pacer._interval == 0
+    assert pacer._next_allowed == deadline
+    assert not pacer.start_upload()
+    clock.now = deadline
+    assert pacer.start_upload()
+    assert pacer.start_upload()

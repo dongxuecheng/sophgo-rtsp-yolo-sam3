@@ -23,7 +23,7 @@ cp BM1684X/yolo26s_fp16_1b.bmodel "${PROJECT_ROOT}/models/yolo26/"
   --url=open@sophgo.com:sophon-demo/common/coco.names
 cp coco.names "${PROJECT_ROOT}/models/yolo26/"
 cd "${PROJECT_ROOT}"
-cp -n config/config.example.yaml config/config.yolo.yaml
+cp -n config/config.yolo.example.yaml config/config.yolo.yaml
 ```
 
 编辑 `config/config.yolo.yaml`，填写实际接口地址和 RTSP，同时修改：

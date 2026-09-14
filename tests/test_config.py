@@ -89,7 +89,7 @@ def test_reject_camera_path_traversal(tmp_path: Path):
 def test_example_yaml_is_parseable():
     project_root = Path(__file__).resolve().parents[1]
 
-    config = load_config(project_root / "config/config.example.yaml")
+    config = load_config(project_root / "config/config.yolo.example.yaml")
 
     assert config.cameras[0].camera_id == "camera_01"
     assert config.yolo26 is not None
@@ -174,6 +174,38 @@ def test_periodic_forces_one_latest_decoder_frame(tmp_path, caplog):
     assert "最新一帧" in caplog.text
     with pytest.raises(ValueError, match="全机轮询"):
         config.interval_for(config.cameras[0])
+
+
+def test_yolo_forces_latest_frame_and_defaults_to_independent_upload_backoff(tmp_path):
+    data = valid_data()
+    data["runtime"]["decoder_queue_size"] = 8
+    config = parse_config(data, tmp_path)
+    assert config.runtime.decoder_queue_size == 1
+    assert config.pipeline.backoff.initial_interval_sec == 2.5
+    assert config.health.inference_stale_sec == 60
+    assert config.health.upload_stale_sec == 300
+
+
+@pytest.mark.parametrize("field,value", [
+    ("after_failures", 0), ("after_failures", True),
+    ("initial_interval_sec", 0), ("initial_interval_sec", float("nan")),
+    ("max_interval_sec", 1), ("max_interval_sec", float("inf")),
+    ("recover_after_successes", 0), ("recover_after_successes", 1.5),
+])
+def test_yolo_rejects_invalid_upload_backoff(tmp_path, field, value):
+    data = valid_data()
+    data["pipeline"]["backoff"] = {field: value}
+    with pytest.raises(ConfigError):
+        parse_config(data, tmp_path)
+
+
+@pytest.mark.parametrize("field", ["inference_stale_sec", "upload_stale_sec"])
+@pytest.mark.parametrize("value", [0, -1, float("nan"), True])
+def test_rejects_invalid_coverage_threshold(tmp_path, field, value):
+    data = valid_data()
+    data["health"] = {field: value}
+    with pytest.raises(ConfigError):
+        parse_config(data, tmp_path)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -1, 0, True])

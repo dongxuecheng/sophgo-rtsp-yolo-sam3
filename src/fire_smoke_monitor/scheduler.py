@@ -10,6 +10,7 @@ from typing import Any, Callable, Optional
 from .config import AppConfig, CameraConfig
 from .domain import UploadFrame
 from .health import HealthRegistry
+from .metrics import CameraMetrics
 from .streams import FrameUnavailableError
 
 
@@ -31,6 +32,7 @@ class InferenceScheduler:
         detector: Optional[Any] = None,
         clock: Callable[[], float] = time.monotonic,
         health: Optional[HealthRegistry] = None,
+        metrics: Optional[CameraMetrics] = None,
     ) -> None:
         if (config.mode == "yolo_trigger") != (detector is not None):
             raise ValueError("YOLO 检测器必须与 mode 一致")
@@ -41,6 +43,7 @@ class InferenceScheduler:
         self._detector = detector
         self._clock = clock
         self._health = health
+        self._metrics = metrics
         self._cameras = config.cameras
         self._cursor = 0
         self._periodic_interval = config.periodic.upload_interval_sec
@@ -48,6 +51,10 @@ class InferenceScheduler:
         self._jobs = [] if config.mode == "periodic" else [
             _Job(camera, config.interval_for(camera), now) for camera in config.cameras
         ]
+        if self._jobs:
+            spacing = min(job.interval_sec for job in self._jobs) / len(self._jobs)
+            for index, job in enumerate(self._jobs):
+                job.next_due += index * spacing
         if self._health is not None:
             self._health.beat("scheduler")
             self._health.require_heartbeat("scheduler", config.health.scheduler_stall_sec)
@@ -58,6 +65,8 @@ class InferenceScheduler:
         if self._mode == "periodic":
             logger.info("统一轮询已启用 upload_interval=%.3fs latest_only=true pending_fifo=disabled",
                         self._periodic_interval)
+        else:
+            logger.info("YOLO 公平轮询已启用 latest_only=true http_blocks_inference=false")
         while not stop_event.is_set() and not self._fatal():
             self._beat()
             if self.run_iteration(stop_event):
@@ -71,23 +80,28 @@ class InferenceScheduler:
         self._beat()
         if self._mode == "periodic":
             return self._run_periodic(stop_event)
-        due = sorted((job for job in self._jobs if job.next_due <= now),
-                     key=lambda job: job.next_due)
-        count = 0
-        for job in due:
-            if (stop_event is not None and stop_event.is_set()) or self._fatal():
-                break
-            self._run_job(job)
-            self._beat()
-            count += 1
-        return count
+        if (stop_event is not None and stop_event.is_set()) or self._fatal():
+            return 0
+        # At most one fresh frame per iteration. Rotating the cursor prevents
+        # fast/short-interval cameras from starving other due cameras.
+        for offset in range(len(self._jobs)):
+            index = (self._cursor + offset) % len(self._jobs)
+            job = self._jobs[index]
+            if job.next_due <= now:
+                self._cursor = (index + 1) % len(self._jobs)
+                self._run_job(job)
+                self._beat()
+                return 1
+        return 0
 
     def _run_job(self, job: _Job) -> None:
+        started = self._clock()
         try:
             self._process_camera(job.camera, self._uploader.submit)
         finally:
-            # YOLO retains per-camera fixed delays, with no replay/catch-up.
-            job.next_due = self._clock() + job.interval_sec
+            # Target start-to-start period includes actual hardware work. If
+            # overloaded, drop missed ticks and yield to other due cameras.
+            job.next_due = max(started + job.interval_sec, self._clock())
 
     def _run_periodic(self, stop_event: Optional[threading.Event]) -> int:
         if (stop_event is not None and stop_event.is_set()) or self._fatal():
@@ -122,7 +136,11 @@ class InferenceScheduler:
             frame_time = self._clock()
             detections = []
             if self._detector is not None:
+                inference_started = self._clock()
                 detections = self._detector.detect(image)
+                if self._metrics is not None:
+                    self._metrics.inferred(camera.camera_id, bool(detections),
+                                           self._clock() - inference_started, frame_time)
                 if not detections:
                     logger.debug("YOLO 未命中 camera=%s", camera.camera_id)
                     if self._health is not None:
@@ -144,12 +162,16 @@ class InferenceScheduler:
                 if self._health is not None:
                     self._health.processing_success()
         except FrameUnavailableError:
+            if self._metrics is not None:
+                self._metrics.event(camera.camera_id, "no_frame")
             logger.debug("跳过无帧摄像头 camera=%s", camera.camera_id)
             if self._health is not None:
                 self._health.degrade(
                     "camera_{}".format(camera.camera_id), "frame_unavailable"
                 )
         except Exception as exc:
+            if self._metrics is not None:
+                self._metrics.event(camera.camera_id, "errors")
             logger.exception("当前帧处理失败 camera=%s mode=%s", camera.camera_id, self._mode)
             if self._health is not None:
                 count = self._health.processing_failure(type(exc).__name__)
@@ -157,6 +179,10 @@ class InferenceScheduler:
                     "连续内部处理失败 count=%d limit=%d",
                     count, self._health.processing_failure_limit,
                 )
+        finally:
+            if self._metrics is not None:
+                self._metrics.processed(camera.camera_id, self._clock() - started)
+
     def _beat(self) -> None:
         if self._health is not None:
             self._health.beat("scheduler")

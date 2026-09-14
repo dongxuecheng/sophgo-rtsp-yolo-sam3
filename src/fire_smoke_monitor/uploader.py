@@ -13,7 +13,8 @@ import httpx
 from .config import PeriodicConfig, PipelineConfig
 from .domain import UploadFrame
 from .health import HealthRegistry
-from .pacing import PeriodicPacer
+from .metrics import CameraMetrics
+from .pacing import PeriodicPacer, YoloUploadPacer
 
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,7 @@ class FrameUploader:
         transport: Optional[httpx.AsyncBaseTransport] = None,
         health: Optional[HealthRegistry] = None,
         periodic: Optional[PeriodicConfig] = None,
+        metrics: Optional[CameraMetrics] = None,
     ):
         if periodic is not None and config.workers not in (1, 2):
             raise ValueError("periodic HTTP 并发只能为 1 或 2")
@@ -109,12 +111,14 @@ class FrameUploader:
         self._clock = clock
         self._transport = transport
         self._health = health
+        self._metrics = metrics
         self._api_key = config.api_key()
         self._lock = threading.Lock()
         self._pending: OrderedDict[str, UploadFrame] = OrderedDict()
         self._active: Set[str] = set()
         self._reserved: Set[str] = set()
         self._pacer = PeriodicPacer(periodic, clock) if periodic is not None else None
+        self._upload_pacer = self._pacer or YoloUploadPacer(config.backoff, clock)
         self._periodic_tasks: Set[asyncio.Task] = set()
         self._client = None
         self._closed = False
@@ -141,6 +145,10 @@ class FrameUploader:
                 return "stopped"
             replaced = frame.camera_id in self._pending
             self._pending[frame.camera_id] = frame
+        if self._metrics is not None:
+            self._metrics.event(frame.camera_id, "submitted")
+            if replaced:
+                self._metrics.event(frame.camera_id, "replaced")
         self._notify(self._wake)
         return "replaced" if replaced else "queued"
 
@@ -303,15 +311,41 @@ class FrameUploader:
 
     async def _take(self) -> Optional[UploadFrame]:
         while True:
+            expired = None
+            delay = None
             with self._lock:
                 if self._closed:
                     return None
                 camera = next((key for key in self._pending if key not in self._active), None)
                 if camera is not None:
-                    self._active.add(camera)
-                    return self._pending.pop(camera)
+                    frame = self._pending[camera]
+                    if self._clock() - frame.created_monotonic > self._config.max_pending_age_sec:
+                        expired = self._pending.pop(camera)
+                    else:
+                        delay = self._upload_pacer.delay()
+                        if delay <= 0 and self._upload_pacer.start_upload():
+                            self._active.add(camera)
+                            return self._pending.pop(camera)
+                        delay = max(0.01, min(0.5, self._upload_pacer.delay()))
                 self._wake.clear()
-            await self._wake.wait()
+            if expired is not None:
+                self._record_expired(expired)
+                continue
+            if delay is None:
+                await self._wake.wait()
+            else:
+                # Do not remove/hold a JPEG while backing off. New hits may
+                # replace it in place; expired hits are dropped before sending.
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+
+    def _record_expired(self, frame: UploadFrame) -> None:
+        if self._metrics is not None:
+            self._metrics.event(frame.camera_id, "expired")
+        logger.warning("丢弃过期待传帧 camera=%s age=%.1fs", frame.camera_id,
+                       self._clock() - frame.created_monotonic)
 
     async def _worker(self, client: PipelineClient) -> None:
         while True:
@@ -329,17 +363,23 @@ class FrameUploader:
         started = self._clock()
         age = started - frame.created_monotonic
         if age > self._config.max_pending_age_sec:
-            logger.warning("丢弃过期待传帧 camera=%s age=%.1fs", frame.camera_id, age)
+            self._record_expired(frame)
             return
         status_code = None
+        cancelled = False
         try:
             # Total deadline includes connection, upload AND response reading.
             await _await_upload(client.upload(frame), timeout_sec=self._config.timeout_sec)
             status_code = 202
+            if self._metrics is not None:
+                self._metrics.accepted(frame.camera_id, frame.created_monotonic)
             if self._health is not None:
                 self._health.recover("remote")
             logger.info("远端已接收 camera=%s status=202 bytes=%d queue_wait=%.3fs elapsed=%.3fs",
                         frame.camera_id, len(frame.jpeg), age, self._clock() - started)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except asyncio.TimeoutError:
             if self._health is not None:
                 self._health.degrade("remote", "timeout")
@@ -361,8 +401,10 @@ class FrameUploader:
             # httpx exception strings can contain endpoints; only log the type.
             logger.warning("上传失败，不补发 camera=%s error=%s", frame.camera_id, type(exc).__name__)
         finally:
-            if self._pacer is not None:
-                self._pacer.report_result(status_code)
+            if not cancelled:
+                if status_code != 202 and self._metrics is not None:
+                    self._metrics.event(frame.camera_id, "failed")
+                self._upload_pacer.report_result(status_code)
 
     def close(self) -> None:
         with self._lock:

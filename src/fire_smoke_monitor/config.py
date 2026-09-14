@@ -50,6 +50,16 @@ class HealthConfig:
     max_consecutive_processing_failures: int
     scheduler_stall_sec: float
     status_log_interval_sec: float
+    inference_stale_sec: float = 60.0
+    upload_stale_sec: float = 300.0
+
+
+@dataclass(frozen=True)
+class UploadBackoffConfig:
+    after_failures: int = 2
+    initial_interval_sec: float = 2.5
+    max_interval_sec: float = 60.0
+    recover_after_successes: int = 3
 
 
 @dataclass(frozen=True)
@@ -80,6 +90,7 @@ class PipelineConfig:
     max_image_bytes: int
     max_image_pixels: int
     env_file: Optional[Path] = None
+    backoff: UploadBackoffConfig = field(default_factory=UploadBackoffConfig)
 
     def api_key(self) -> str:
         if not self.api_key_env:
@@ -207,6 +218,19 @@ def _pipeline_config(raw: Mapping[str, Any], base_dir: Path) -> PipelineConfig:
     api_key_env = str(raw.get("api_key_env", "")).strip()
     if api_key_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
         raise ConfigError("pipeline.api_key_env 必须是环境变量名称，不能直接填写密钥")
+    backoff_raw = _mapping(raw.get("backoff", {}), "pipeline.backoff")
+    backoff = UploadBackoffConfig(
+        after_failures=_integer(backoff_raw.get("after_failures", 2),
+                                "pipeline.backoff.after_failures", 1, 100),
+        initial_interval_sec=_positive(backoff_raw.get("initial_interval_sec", 2.5),
+                                       "pipeline.backoff.initial_interval_sec"),
+        max_interval_sec=_positive(backoff_raw.get("max_interval_sec", 60),
+                                   "pipeline.backoff.max_interval_sec"),
+        recover_after_successes=_integer(backoff_raw.get("recover_after_successes", 3),
+                                         "pipeline.backoff.recover_after_successes", 1, 100),
+    )
+    if backoff.max_interval_sec < backoff.initial_interval_sec:
+        raise ConfigError("pipeline.backoff.max_interval_sec 不能小于 initial_interval_sec")
     return PipelineConfig(
         endpoint=endpoint,
         machine_id=_identifier(_required(raw, "machine_id", "pipeline"), "pipeline.machine_id"),
@@ -223,6 +247,7 @@ def _pipeline_config(raw: Mapping[str, Any], base_dir: Path) -> PipelineConfig:
             raw.get("max_image_pixels", 16000000), "pipeline.max_image_pixels", 1, 64000000
         ),
         env_file=base_dir / "pipeline.env",
+        backoff=backoff,
     )
 
 
@@ -244,11 +269,11 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
         runtime_raw.get("min_free_disk_gb", 5), "runtime.min_free_disk_gb"
     )
     decoder_queue_size = _integer(
-        runtime_raw.get("decoder_queue_size", 1 if mode == "periodic" else 2),
+        runtime_raw.get("decoder_queue_size", 1),
         "runtime.decoder_queue_size", 1, 8,
     )
-    if mode == "periodic" and decoder_queue_size != 1:
-        logger.warning("periodic 模式固定只缓存每路最新一帧，decoder_queue_size 已设为 1")
+    if decoder_queue_size != 1:
+        logger.warning("只缓存每路最新一帧，decoder_queue_size 已设为 1 mode=%s", mode)
         decoder_queue_size = 1
     runtime = RuntimeConfig(
         dev_id=_integer(runtime_raw.get("dev_id", 0), "runtime.dev_id", 0, 255),
@@ -292,6 +317,10 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> AppConfig:
             health_raw.get("status_log_interval_sec", 300),
             "health.status_log_interval_sec",
         ),
+        inference_stale_sec=_positive(health_raw.get("inference_stale_sec", 60),
+                                      "health.inference_stale_sec"),
+        upload_stale_sec=_positive(health_raw.get("upload_stale_sec", 300),
+                                   "health.upload_stale_sec"),
     )
 
     camera_items = _sequence(_required(root, "cameras", "root"), "cameras")

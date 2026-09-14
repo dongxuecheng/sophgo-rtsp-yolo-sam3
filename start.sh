@@ -28,7 +28,7 @@ if [[ ! -x "${python_bin}" ]]; then
 fi
 if [[ ! -f "${config_path}" ]]; then
     printf 'Config not found: %s\n' "${config_path}" >&2
-    printf '%s\n' 'Copy and edit config/config.periodic.example.yaml or config/config.example.yaml first.' >&2
+    printf '%s\n' 'Copy and edit config/config.periodic.example.yaml or config/config.yolo.example.yaml first.' >&2
     exit 2
 fi
 

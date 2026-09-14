@@ -1,48 +1,83 @@
-# 不进行本地 YOLO 推理；全机统一轮询，到该路且有 HTTP 空位才抓最新帧。
+# periodic 模板。复制为 config/config.periodic.yaml 或 config/config.yaml 后修改。
+# 不运行 YOLO、不需要模型；全机统一轮询，有上传空位才取该路最新一帧。
+# 不提前将各路图存入 FIFO，不保存本地图片，失败/过期不补发旧图。
+# 路径相对本 YAML；保留实际接口、摄像头和密钥，修改后检查并重启。
 mode: periodic
 
 pipeline:
+  # 远端完整 HTTP(S) 地址，必须以 /v1/frames 结尾，不是 GitHub 地址。
   endpoint: http://192.168.1.200:18080/v1/frames
+  # 本机唯一标识，多台盒子不能重复；1-64 位字母、数字、下划线、横线。
   machine_id: se7-01
+  # 无鉴权留空；有鉴权填变量名 PIPELINE_API_KEY，值放环境或同目录 pipeline.env。
   api_key_env: ""
-  workers: 2  # periodic 只允许 1 或 2；名额占满时不提前取帧
+  # 同时最多几个 HTTP 请求，periodic 只允许 1 或 2；全部占满时暂停取帧。
+  workers: 2
+  # 单次请求总超时（秒），含连接、发送和读响应；失败不重试这张图。
   timeout_sec: 10
-  max_pending_age_sec: 3  # 仅防编码/跨线程交接意外耗时；没有待上传 FIFO
+  # 采样到开始发送的最大年龄（秒），防编码/交接异常延迟；没有待传图片 FIFO。
+  max_pending_age_sec: 3
+  # JPEG 最大字节数（此处 8 MiB），须与远端 MAX_IMAGE_BYTES 一致；超限跳过。
   max_image_bytes: 8388608
+  # 最大像素数（宽×高，此处 1600 万），须与远端一致；不自动缩放原图。
   max_image_pixels: 16000000
 
+periodic:
+  # 全机轮询步长（秒），每 2.5 秒安排下一路，不是每路每 2.5 秒上传。
+  # 33 路正常一轮约 82.5 秒加编码/调度耗时；忙碌/退避会延长，不追赶欠下轮次。
+  upload_interval_sec: 2.5
+  # 按响应完成顺序，每连续 N 次 429/503 间隔翻倍；两种状态码合并计数。
+  backoff_after_failures: 2
+  # 降频间隔上限（秒），须 >= upload_interval_sec；退避期间不提前抓图。
+  backoff_max_interval_sec: 60
+  # 连续 N 次 202 且 accepted=true 后间隔减半，逐步恢复到 upload_interval_sec。
+  recover_after_successes: 3
+
 runtime:
+  # BM1684X 设备编号，SoC 单芯片通常为 0。
   dev_id: 0
-  decoder_queue_size: 1  # periodic 固定为 1，新帧覆盖旧帧
+  # 每路应用层只留最新一张待采样帧，固定为 1；旧值会覆盖并告警。
+  # RTSP 仍持续解码；最新已解码不等于摄像头此刻曝光帧，网络/解码可有延迟。
+  decoder_queue_size: 1
+  # 秒。读取时持续无帧达到此时间后申请后台重建；检查在该路轮询时发生。
+  # read 非阻塞；不是网络连接超时，也不是后台每 2 秒主动巡检一次。
   read_timeout_sec: 2
+  # 单路重建重试间隔及无帧告警冷却（秒）；离线路跳过本轮，下一轮再尝试。
   reconnect_cooldown_sec: 10
+  # INFO 记录受理结果和异常；DEBUG 额外记录每帧提交详情。
   log_level: INFO
+  # 日志目录，相对本 YAML；两种模式均不保存检测图片。
   log_dir: ../logs
+  # 含当天的日志保留自然日数，允许 1-30。
   log_retention_days: 30
+  # 单个受管日志文件上限（MiB），达到后分段轮转。
   log_max_file_mb: 100
+  # 所有 monitor-*.log 合计上限（MiB），须 >= 单文件上限；优先删除旧分段。
   log_max_total_mb: 1024
+  # 日志所在磁盘至少保留的空间（GiB），不足时清旧日志并抑制低级别日志。
   min_free_disk_gb: 5
+  # 日志容量/磁盘余量检查周期（秒），允许 10-3600。
   disk_check_interval_sec: 60
 
 health:
+  # 连续本地取帧后编码/提交异常达到次数后退出，由 systemd 重启；成功一次清零。
+  # 摄像头无帧、HTTP 失败不计入致命异常阈值。
   max_consecutive_processing_failures: 10
+  # 主循环/上传循环最长无心跳时间（秒），须大于最慢单帧处理耗时。
+  # 等待下一路、HTTP 空位或退避期间仍有心跳，不因正常等待超过 30 秒而退出。
   scheduler_stall_sec: 30
+  # 组件健康状态定期日志间隔（秒）；状态变化时另有即时日志。
   status_log_interval_sec: 300
 
-periodic:
-  # 全机每 2.5 秒选择下一路；33 路正常一轮约 82.5 秒，不追赶积欠轮次。
-  upload_interval_sec: 2.5
-  # 连续两次 429/503 后间隔翻倍，每再连续两次继续翻倍，上限 60 秒。
-  backoff_after_failures: 2
-  backoff_max_interval_sec: 60
-  # 连续三次 202 accepted=true 后间隔减半，逐步恢复至 2.5 秒。
-  recover_after_successes: 3
-
+# 列表顺序轮询，软件最多 64 路；实际承载需评估码率/分辨率/帧率及设备负载。
+# 不要添加旧 periodic.interval_sec 或每路 interval_sec，新模式会明确拒绝。
 cameras:
+  # 接口的 stream_id；1-64 位字母、数字、下划线、横线，不可重复。
   - id: camera_01
+    # 可选显示名称（最长 256 字符），作为 stream_name 上传。
     name: 仓库东门
+    # 实际 RTSP 地址；含密码的配置文件建议 chmod 600。
     url: rtsp://user:password@192.168.1.101:554/stream1
-  # - id: camera_02
-  #   name: 仓库西门
-  #   url: rtsp://user:password@192.168.1.102:554/stream1
-  # periodic 不设置每路 interval_sec。
+  - id: camera_02
+    name: 仓库西门
+    url: rtsp://user:password@192.168.1.102:554/stream1

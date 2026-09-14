@@ -5,7 +5,7 @@
 两种模式通过 YAML 的 `mode` 切换，重启后生效：
 
 - `periodic`：全机统一轮询，到该路且有 HTTP 空位才抓最新帧直传；不加载 YOLO，不要求模型文件。
-- `yolo_trigger`：共享一份 YOLO26 模型，周期检测，命中指定目标才上传。
+- `yolo_trigger`：共享一份 YOLO26 模型，按实际处理耗时公平轮询各路，命中指定目标才异步上传；HTTP 忙碌不阻止 YOLO 检测。
 
 两种模式都上传整张未标注 JPEG，**不在盒子保存图片**。
 远端 [ascend-sam3-llm-pipeline](https://github.com/dongxuecheng/ascend-sam3-llm-pipeline)
@@ -49,8 +49,28 @@ chmod 600 config/config.periodic.yaml
 ```
 
 编辑配置中的实际服务器地址、设备标识和摄像头 URL，再执行快速启动命令。
-YOLO 模式改用 `config/config.example.yaml`，模型准备见 [YOLO26 教程](docs/YOLO26_MODELS.md)。
+YOLO 模式改用 `config/config.yolo.example.yaml`，模型准备见 [YOLO26 教程](docs/YOLO26_MODELS.md)。
 不要从 PyPI 安装普通 OpenCV 或替换算能 SDK/SAIL。
+
+### 两份完整配置模板
+
+- [YOLO 命中上传配置](config/config.yolo.example.yaml)：每路目标检测周期默认 3 秒，HTTP 并发 2；命中图最长等待年龄 60 秒。
+- [periodic 轮询上传配置](config/config.periodic.example.yaml)：全机每 2.5 秒轮到下一路，HTTP 并发 2；无 YOLO 模型依赖。
+
+模板逐项注释了参数含义、单位和限制；地址、模型和摄像头均为示例，不能直接用于现场。
+旧 `config/config.example.yaml` 已更名为 YOLO 专用模板；不会改动现场的 `config.yaml`。
+
+```bash
+# 二选一复制，-n 保留已有现场配置。编辑接口、摄像头；YOLO 还须编辑模型和类别。
+cp -n config/config.yolo.example.yaml config/config.yolo.yaml
+cp -n config/config.periodic.example.yaml config/config.periodic.yaml
+chmod 600 config/config.yolo.yaml config/config.periodic.yaml
+
+# YOLO：先检查，再前台运行；运行前先停止旧实例。
+bash start.sh config/config.yolo.yaml --check-config
+bash start.sh config/config.yolo.yaml
+# periodic 则将上面两条命令的配置参数换成 config/config.periodic.yaml。
+```
 
 ## 配置
 
@@ -100,13 +120,45 @@ cameras:
 - `machine_id`、摄像头 `id` 只允许 1–64 位字母、数字、下划线和横线，摄像头 ID 必须唯一。
 - periodic 的 `upload_interval_sec` 是**全机**轮询间隔：默认每 2.5 秒安排下一路，33 路正常一轮约 82.5 秒（另加编码、调度耗时）；不是每路每 2.5 秒上传。按配置顺序循环，离线路跳过本轮，下一轮再尝试。
 - periodic 上传名额满或全机退避时暂停采样，不提前读取/编码后续路的图片；恢复后取最新帧，不追赶错过的轮次。HTTP 最多并发 1–2 个，实际单路周期在忙碌/降频时会延长。
-- 仅 YOLO 支持每路 `interval_sec` 覆盖 `models.yolo26.interval_sec`；间隔指本路检测/编码/入队完成后的等待时间，不等待 HTTP，不追赶旧任务。
-- `runtime.dev_id` 默认 0。periodic 固定 `decoder_queue_size=1`，应用层每路只保留最新一张待采样帧；YOLO 默认 2。底层编解码器本身仍有必要的工作/参考帧缓冲。
+- 仅 YOLO 支持每路 `interval_sec` 覆盖 `models.yolo26.interval_sec`；现在指本路**开始到开始的目标周期**，包含实际推理、编码、提交耗时。算力不足时周期延长，不追赶旧任务，不等待 HTTP。
+- `runtime.dev_id` 默认 0。两种模式均固定 `decoder_queue_size=1`，应用层每路只保留最新一张待采样帧；旧值会覆盖并告警。底层编解码器本身仍有必要的工作/参考帧缓冲。
 - RTSP 持续硬件解码，采样间隔不会自动降低摄像头传输码率/解码帧率。持续无帧超过 `read_timeout_sec`（默认 2）后，仅后台重建该路，重试间隔 `reconnect_cooldown_sec` 默认 10 秒。
 - `periodic` 忽略整个 `models`。YOLO 命中多个框也只上传一张原图，本地漏检会挡住后续复核。
 - 原图不缩放；默认最大 8 MiB、1600 万像素。超限时跳过并记日志，可降低摄像头子码流分辨率。调整 `max_image_bytes/max_image_pixels` 须同步远端限制。
 - 相对模型/日志路径以 YAML 所在目录为基准。旧配置不添加新增字段时使用安全默认值：30 天、单文件 100 MiB、日志总量 1 GiB、日志所在文件系统至少保留 5 GiB。
 - 旧 `output_root/save_cooldown_sec` 已停用；不会转换成上传冷却。`min_free_disk_gb` 现在用于日志磁盘保护，两种模式仍不写检测图片。
+
+### YOLO 多路公平检测与耗时
+
+1. 启动时将各路首轮错峰；统一调度器从上次位置继续，选取下一路已到期摄像头。
+2. 轮到时非阻塞读取最新解码帧，调用唯一 YOLO 实例；无帧跳过，不阻塞其余摄像头。
+3. 未命中直接转下一路；命中则编码原图并立即提交独立上传线程，不等待 HTTP 响应。非命中图不会覆盖待传命中图。
+4. 该路下一次到期为 `max(本次开始 + interval_sec, 本次处理完成)`；结束后转向下一路，不让已到期的快路持续占用模型。
+
+所有在线且持续可读、模型能正常处理的摄像头，都会反复获得推理机会。这里保证的是调度公平，**不是每个视频帧都推理、模型绝不漏检或每张命中图必定上传**。硬件吞吐不足不会通过增加定时器解决；程序也不会积压旧推理任务。
+
+相同周期的 N 路，在稳定负载下可粗略估算：
+
+```text
+每路实际周期 ≈ max(配置 interval_sec, N 路取帧 + 推理 + 命中编码/提交的总耗时)
+目标出现到远端受理 ≈ 等待该路下一次采样 + 推理/编码 + 上传排队 + HTTP 耗时
+```
+
+例：33 路每次本地处理 0.25 秒，一轮约 8.25 秒；即使配置 3 秒也不能保证每路 3 秒一次。
+这只是示例，**不是 BM1684X 实测速度**；实际以日志中的 `infer_gap` 为准，并留出负载波动余量。
+最新解码帧也可能含摄像头、网络和解码延迟，盒子采样时间不等于真实曝光时间。
+
+YOLO 默认每 300 秒为每路输出一次 `摄像头覆盖` 统计（计数自本次进程启动累计）：
+
+- `inferred` / `hits` / `no_frame` / `errors`：成功推理、命中、无帧和本地异常次数。
+- `infer_ms`：最近一次成功 YOLO 耗时；`process_ms`：最近一次本地处理总耗时；`infer_gap`：最近两次成功推理对应的采样间隔。
+- `submitted` / `accepted`：提交上传器 / 远端确认受理数；`replaced` / `expired` / `failed`：待传命中图被替换、过期、请求失败数。
+- `last_infer_age` / `last_upload_age`：距最近成功推理/上传的秒数；上传从未成功时为 -1。
+- `unconfirmed_hit_age`：命中尚无对应受理的持续秒数。持续命中不会一直重置，成功上传较新图可覆盖之前被替换的旧命中。
+
+`health.inference_stale_sec` 默认 60 秒、`health.upload_stale_sec` 默认 300 秒，分别标记 `inference_<id>`、`delivery_<id>` 降级；没有命中的路不因没有上传而报警，不由这些告警触发重启。
+请将推理覆盖阈值设得大于最长实际轮询周期；`scheduler_stall_sec` 则须大于最慢**单次**本地处理耗时。
+`status_log_interval_sec` 控制统计日志周期，可在联调时调小，状态变化仍即时记录。
 
 ### 从旧 periodic 配置升级
 
@@ -174,7 +226,7 @@ YOLO/BMCV 处理在一个硬件线程串行执行；压缩 JPEG 才进入独立 
 JPEG 通过 `Bmcv.imencode` 调用 Sophon OpenCV，JPU 是否实际启用需在盒子验证。
 
 periodic 不使用待传 JPEG FIFO：先按全机节奏预留 HTTP 名额，再非阻塞读取该路唯一最新帧、编码、直接交给 HTTP 循环；包含取帧/编码/交接在内的名额总数也不超过 `workers`，每路最多一个在途请求。非轮到的路只在解码器中覆盖最新帧。
-YOLO 保留原有有界队列：每路最多一张正在上传和一张最新待传图，新图替换旧图，保持队列位置；名额满时只排队压缩 JPEG，不阻塞检测。
+YOLO 使用有界最新命中队列：每路最多一张正在上传和一张最新待传图，新命中图替换旧命中图，保持公平队列位置；名额满时只排队压缩 JPEG，不阻塞检测。有空位、没有退避及更早待传任务时立即发起请求；不能绕过已有并发上限。
 HTTP 并发默认 2（periodic 只允许 1–2，YOLO 可设 1–8）；`timeout_sec` 覆盖连接、等待连接池、发送图片及读取响应，超时 Task 会被取消并完整回收。
 超时日志中的 `scope=total` 表示达到总截止时间；`scope=httpx` 表示传输层主动报告了具体的 `ConnectTimeout/WriteTimeout/ReadTimeout/PoolTimeout`。
 超时、429、503 等不补发旧图；下一次采样继续，网络恢复后自动恢复。待传图过期或程序退出时丢弃，没有磁盘补发队列。
@@ -186,6 +238,15 @@ periodic 自动降频以本机所有上传的**完成结果顺序**计数，429 
 - 默认连续三次合法的 `202 + accepted=true` 才将间隔减半，逐步恢复至基础间隔；不提前已经安排好的下一次时刻，不补偿过去欠下的请求。
 - 非 429/503 结果会打断连续过载计数；超时、其他 HTTP 错误会打断连续成功计数，不会触发这里的过载倍增策略。
 - 日志 `periodic 全机降频` / `periodic 上传频率逐步恢复` 显示当前全机间隔。如频繁降频，应进一步检查服务端处理能力；节流不能保证每张受理图都完成远端检测。
+
+YOLO 的降频由 `pipeline.backoff` 单独控制，不读取 periodic 的时间参数：
+
+- 正常没有人为上传间隔；默认每连续两次 429/503，间隔从 `0 → 2.5 → 5 → 10 → 20 → 40 → 60` 秒逐级增加，只限制本机 HTTP，不暂停各路推理。
+- 失败请求对应的图直接丢弃，不重试。退避中仍可接收新命中，每路只替换一张待传图；过期图丢弃，恢复后不集中补发。
+- 默认连续三次确认受理后逐级减半，最终恢复为有空位即发；保留当前已安排的截止时刻，不提前集中放行。日志前缀为 `yolo_trigger 全机降频` / `yolo_trigger 上传频率逐步恢复`，间隔 0 表示不再人为限速。
+- YOLO 模板的 `max_pending_age_sec=60` 包含推理/编码耗时，可根据可接受延迟调整；老配置保留原值，不自动改大。频繁 `expired` 时需查看实际处理耗时、HTTP 吞吐和限流，而不是只增大队列年龄。
+
+若 33 路持续同时命中而服务器只能接收少量请求，“立即上传所有命中图”和“限制并发、保留最新、不补发旧图”无法同时绝对保证。本实现优先保持检测覆盖与新鲜度，不提供可靠事件存储或逐帧必达承诺。
 
 ### 健康检查与自动恢复边界
 
@@ -232,7 +293,7 @@ systemctl show fire-smoke-monitor -p ActiveState -p SubState -p StatusText -p NR
 - 缺 `sophon.sail` / `cv2`：检查完整 SAIL 以及 SDK OpenCV，禁止普通 pip OpenCV 覆盖。
 - `already running`：先停止已有脚本/systemd 实例；锁会随进程退出释放，不要删除锁文件绕过保护。
 - `401`：核对密钥；`400/422`：核对图片/ID/参数；`413`：图片过大。
-- 频繁 `429/503`：periodic 自动降低全机频率；仍应检查远端负载/网络，必要时增大 `periodic.upload_interval_sec`。YOLO 待传替换频繁时增大检测间隔。
+- 频繁 `429/503`：两种模式均自动降低本机上传频率，YOLO 不因此降低推理频率；仍应检查远端负载/网络。periodic 可增大 `periodic.upload_interval_sec`；YOLO 待传替换多表明命中产生速度高于上传吞吐。
 - 有 202 无证据：查远端模型日志；`GET /health` 只检查流水线服务及累计计数，不验证模型效果。
 - 观察盒子：`free -h`、`vmstat 1`、`bm-smi`、`cat /proc/vpuinfo`、`cat /proc/jpuinfo`、`df -h /data`。
 

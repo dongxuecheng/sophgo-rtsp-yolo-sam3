@@ -7,7 +7,7 @@ __pycache__/
 output/
 config/config.yaml
 config/config.*.yaml
-!config/config.example.yaml
+!config/config.yolo.example.yaml
 !config/config.periodic.example.yaml
 config/pipeline.env
 logs/

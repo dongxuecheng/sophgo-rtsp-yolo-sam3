@@ -5,15 +5,19 @@ from email import policy
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from fire_smoke_monitor.config import PeriodicConfig, PipelineConfig
+from fire_smoke_monitor.config import HealthConfig, PeriodicConfig, PipelineConfig, parse_config
 from fire_smoke_monitor.domain import UploadFrame
 from fire_smoke_monitor.health import HealthRegistry
+from fire_smoke_monitor.metrics import CameraMetrics
+from fire_smoke_monitor.scheduler import InferenceScheduler
 from fire_smoke_monitor.uploader import (
     FrameUploader,
     PipelineClient,
@@ -347,6 +351,122 @@ class PeriodicClock:
 
     def __call__(self):
         return self.now
+
+
+def test_yolo_overload_keeps_only_latest_hit_and_recovers_without_retries():
+    clock, calls = PeriodicClock(), []
+    metrics = CameraMetrics(["cam1", "cam2", "cam3"], HealthConfig(10, 30, 300), clock=clock)
+
+    async def handler(request):
+        calls.append(request)
+        return reply({1: 429, 2: 503}.get(len(calls), 202))
+
+    uploader = FrameUploader(
+        config(), ["cam1", "cam2", "cam3"], clock=clock, metrics=metrics,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        for index, camera in enumerate(("cam1", "cam2"), 1):
+            uploader.submit(frame(camera, jpeg=camera.encode(), created=clock()))
+            wait_for(lambda: len(calls) == index and not uploader._active)
+        # No initial 2.5s wait in YOLO; only the overload introduces one.
+        assert clock() == 100
+        assert uploader._upload_pacer._interval == 2.5
+        uploader.submit(frame("cam3", jpeg=b"old-hit", created=clock()))
+        assert uploader.submit(frame("cam3", jpeg=b"latest-hit", created=clock())) == "replaced"
+        assert len(uploader._pending) == 1 and len(calls) == 2
+        for index, camera in enumerate(("cam3", "cam1", "cam2"), 3):
+            if camera != "cam3":
+                uploader.submit(frame(camera, jpeg=b"new-hit", created=clock()))
+            clock.now += 2.5
+            uploader._notify(uploader._wake)
+            wait_for(lambda: len(calls) == index and not uploader._active)
+        assert uploader._upload_pacer._interval == 0
+        assert metrics.snapshot("cam3").replaced == 1
+        assert metrics.snapshot("cam3").accepted == 1
+        assert metrics.snapshot("cam1").failed == 1
+        payloads = [fields_from_request(req)["image"].get_payload(decode=True) for req in calls]
+        assert payloads == [b"cam1", b"cam2", b"latest-hit", b"new-hit", b"new-hit"]
+    finally:
+        uploader.close()
+
+
+def test_yolo_expiry_during_backoff_does_not_upload_or_block_other_camera():
+    clock, calls = PeriodicClock(), []
+    metrics = CameraMetrics(["cam1", "cam2"], HealthConfig(10, 30, 300), clock=clock)
+
+    async def handler(request):
+        calls.append(request)
+        return reply()
+
+    uploader = FrameUploader(
+        config(max_pending_age_sec=1), ["cam1", "cam2"], clock=clock, metrics=metrics,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        uploader._upload_pacer.report_result(503)
+        uploader._upload_pacer.report_result(503)
+        uploader.submit(frame("cam1", created=clock()))
+        clock.now += 2.5
+        uploader.submit(frame("cam2", jpeg=b"fresh-hit", created=clock()))
+        wait_for(lambda: len(calls) == 1 and not uploader._active)
+        assert metrics.snapshot("cam1").expired == 1
+        assert metrics.snapshot("cam2").accepted == 1
+        assert not uploader._pending
+        assert fields_from_request(calls[0])["stream_id"].get_payload(decode=True) == b"cam2"
+    finally:
+        uploader.close()
+
+
+def test_yolo_33_cameras_continue_two_rounds_with_real_uploader_saturated():
+    clock, calls, release = PeriodicClock(), [], threading.Event()
+    cameras = ["cam{}".format(index) for index in range(33)]
+    cfg = parse_config({
+        "mode": "yolo_trigger",
+        "pipeline": {"endpoint": "http://example.invalid/v1/frames", "machine_id": "box-1",
+                     "workers": 2, "timeout_sec": 5, "max_pending_age_sec": 60},
+        "models": {"yolo26": {"bmodel": "missing", "class_names": "missing",
+                              "target_classes": ["fire"], "interval_sec": 3}},
+        "cameras": [{"id": camera, "url": "rtsp://example.invalid/live"} for camera in cameras],
+    }, Path("."))
+    metrics = CameraMetrics(cameras, cfg.health, clock=clock)
+
+    async def handler(request):
+        calls.append(request)
+        await wait_event(release)
+        return reply()
+
+    def detect(image):
+        clock.now += 0.2
+        return [object()]
+
+    uploader = FrameUploader(cfg.pipeline, cameras, clock=clock, metrics=metrics,
+                             transport=httpx.MockTransport(handler))
+    scheduler = InferenceScheduler(
+        cfg, SimpleNamespace(read=lambda camera: camera),
+        SimpleNamespace(encode=lambda image: image.encode()), uploader,
+        SimpleNamespace(detect=detect), clock=clock, metrics=metrics,
+    )
+    try:
+        for index in range(66):
+            assert scheduler.run_iteration() == 1
+            if index < 2:
+                wait_for(lambda: len(calls) == index + 1)
+        assert all(metrics.snapshot(camera).inferences == 2 for camera in cameras)
+        with uploader._lock:
+            assert len(uploader._active) == 2
+            assert len(uploader._pending) == 33  # one latest pending hit per camera
+        assert len(calls) == 2
+        release.set()
+        wait_for(lambda: len(calls) == 35 and not uploader._active and not uploader._pending)
+        assert all(metrics.snapshot(camera).accepted >= 1 for camera in cameras)
+        received_ids = [fields_from_request(req)["stream_id"].get_payload(decode=True).decode()
+                        for req in calls]
+        assert received_ids == cameras + cameras[:2]
+        assert len(calls) == 35  # two in flight + 33 latest, NOT 66 stale queued images
+    finally:
+        release.set()
+        uploader.close()
 
 
 @pytest.mark.parametrize("workers", [1, 2])

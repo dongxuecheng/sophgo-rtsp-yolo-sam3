@@ -68,6 +68,47 @@ def test_periodic_application_never_loads_yolo_and_closes_once(monkeypatch):
     assert events == ["uploader-init", "source-init", "uploader-close", "source-close"]
 
 
+def test_yolo_application_shares_one_metrics_registry_with_uploader_and_scheduler(monkeypatch):
+    events, constructed = [], []
+    install_fakes(monkeypatch, events)
+
+    class Uploader:
+        def __init__(self, config, cameras, **kwargs):
+            assert kwargs["periodic"] is None
+            self.metrics = kwargs["metrics"]
+
+        def is_healthy(self):
+            return True
+
+        def close(self):
+            events.append("uploader-close")
+
+    def detector(*args):
+        result = SimpleNamespace(close=lambda: events.append("detector-close"))
+        constructed.append(result)
+        return result
+
+    monkeypatch.setattr(app, "FrameUploader", Uploader)
+    monkeypatch.setattr(models, "Yolo26Detector", detector)
+    cfg = parse_config({
+        "mode": "yolo_trigger",
+        "pipeline": {"endpoint": "http://example.invalid/v1/frames", "machine_id": "box-1"},
+        "models": {"yolo26": {"bmodel": "missing", "class_names": "missing",
+                              "target_classes": ["fire"]}},
+        "cameras": [{"id": "cam{}".format(i), "url": "rtsp://example.invalid/live"}
+                    for i in range(33)],
+    }, Path("."))
+    application = app.build_application(cfg)
+    try:
+        assert len(constructed) == 1
+        assert len(application._scheduler._jobs) == 33
+        assert application._scheduler._detector is constructed[0]
+        assert application._scheduler._metrics is application._uploader.metrics
+        assert application._health.inspect().status_text == "healthy"
+    finally:
+        application.close()
+
+
 def test_startup_failure_closes_started_uploader(monkeypatch):
     events = []
     install_fakes(monkeypatch, events)
