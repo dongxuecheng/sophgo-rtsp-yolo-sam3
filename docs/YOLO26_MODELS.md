@@ -63,8 +63,8 @@ path: /data/fire_smoke
 train: images/train
 val: images/val
 names:
-  0: fire
-  1: smoke
+  0: smoke
+  1: fire
 ```
 
 训练示例：
